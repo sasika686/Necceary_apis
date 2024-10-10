@@ -1,0 +1,46 @@
+from odoo import http
+from odoo.http import request, Response
+import json
+from datetime import date, datetime
+import logging
+from .authentication import authenticate_user, cors_response  # Import the authentication functions
+
+_logger = logging.getLogger(__name__)  # Set up Odoo's built-in logger
+
+def date_handler(obj):
+    if isinstance(obj, (date, datetime)):
+        return obj.isoformat()  # Serialize date and datetime to ISO format
+    raise TypeError("Type not serializable")  # Raise error for non-serializable types
+
+class SalesDetailsController(http.Controller):
+
+    @http.route('/api/sales_details', type='http', auth='none', methods=['GET'], csrf=False)
+    def get_finished_goods_inventory(self, **kwargs):
+        try:
+            # Authenticate user
+            auth_header = request.httprequest.headers.get('Authorization')
+            if not auth_header:
+                return cors_response(Response(json.dumps({'error': 'Missing Authorization header'}), content_type='application/json', status=401))
+            try:
+                user = authenticate_user(auth_header)
+            except Exception as e:
+                return cors_response(Response(json.dumps({'error': 'Authentication failed', 'details': str(e)}), content_type='application/json', status=401))
+
+            # Your main logic to fetch finished goods inventory
+            invoices = request.env['account.move'].sudo().search([])
+            invoice_data = []
+            for invoice in invoices:
+                invoice_data.append({
+                    'Invoice Date': invoice.invoice_date,
+                    'Customer Name': invoice.partner_id.name,
+                    'Invoice Number': invoice.name,
+                    'PO Number': invoice.ref,
+                    'Invoice Ref' : invoice.invoice_origin,
+                    'Company Name': invoice.company_id.name,
+                    'Value': float(invoice.amount_total_signed),
+                    'Status': invoice.state,
+                })
+            return cors_response(Response(json.dumps(invoice_data, default=date_handler), content_type='application/json'))
+        except Exception as e:
+            _logger.error(f"Error fetching finished goods inventory: {str(e)}")
+            return cors_response(Response(json.dumps({'error': str(e)}), content_type='application/json', status=500))
