@@ -3,21 +3,21 @@ from odoo.http import request, Response
 import json
 from datetime import date, datetime
 import logging
-from .authentication import authenticate_user, cors_response  # Import the authentication functions
+from .authentication import authenticate_user, cors_response
 
-_logger = logging.getLogger(__name__)  # Set up Odoo's built-in logger
+_logger = logging.getLogger(__name__)
 
 def date_handler(obj):
     if isinstance(obj, (date, datetime)):
-        return obj.isoformat()  # Serialize date and datetime to ISO format
-    raise TypeError("Type not serializable")  # Raise error for non-serializable types
+        return obj.isoformat()
+    raise TypeError("Type not serializable")
 
 class POOrdersController(http.Controller):
 
     @http.route('/api/po_orders', type='http', auth='none', methods=['GET'], csrf=False)
     def get_po_orders(self, **kwargs):
         try:
-            # Authenticate user
+            # Authentication (kept as is)
             auth_header = request.httprequest.headers.get('Authorization')
             if not auth_header:
                 return cors_response(Response(json.dumps({'error': 'Missing Authorization header'}), content_type='application/json', status=401))
@@ -26,33 +26,116 @@ class POOrdersController(http.Controller):
             except Exception as e:
                 return cors_response(Response(json.dumps({'error': 'Authentication failed', 'details': str(e)}), content_type='application/json', status=401))
 
-              # Your main logic to fetch purchase orders
-            purchases = request.env['purchase.order'].sudo().search([("state", "=", "purchase")])
+            # Fetch purchase orders
+            purchases = request.env['purchase.order'].sudo().search([("state", "in", ["purchase", "done"])])
             purchases_data = []
             for purchase in purchases:
-                # Get the related invoice(s)
-                invoices = purchase.invoice_ids
-
-                # Get products and descriptions
-                products = []
-                for line in purchase.order_line:
-                    products.append({
-                        'Product': line.product_id.name,
-                        'Description': line.name,
-                        'Quantity': line.product_qty,
-                        'Unit Price': line.price_unit,
-                        'Subtotal': line.price_subtotal
-                    })
-
-                purchases_data.append({
-                    'PO': purchase.name,
-                    'Order Date': purchase.date_approve,
+                po_data = {
+                    'PO No': purchase.name,
+                    'Invoice No.': ', '.join(purchase.invoice_ids.mapped('name')),
                     'Supplier Name': purchase.partner_id.name,
+                    'Order Date': purchase.date_order,
                     'PO Cost': purchase.amount_total,
-                    'Invoice Number': ', '.join(invoices.mapped('name')) if invoices else '',
-                    'Products': products
-                })
+                    'Items': [],
+                    'Reference Numbers': []
+                }
+                
+                has_products = False
+                for line in purchase.order_line:
+                    item_data = {
+                        'Item': line.product_id.default_code,
+                        'Description': line.name,
+                        'Item Cost': line.price_unit,
+                        'Ordered Qty': line.product_qty,
+                        'Is Service': line.product_id.type == 'service'
+                    }
+                    po_data['Items'].append(item_data)
+                    
+                    if line.product_id.type != 'service':
+                        has_products = True
+
+                # Fetch reference numbers from stock.move.line only if there are products
+                if has_products:
+                    stock_moves = request.env['stock.move.line'].sudo().search([('picking_id.purchase_id', '=', purchase.id)])
+                    reference_numbers = set(stock_moves.mapped('picking_id.name'))
+                    po_data['Reference Numbers'] = list(reference_numbers)
+                
+                po_data['Has Products'] = has_products
+                purchases_data.append(po_data)
+
             return cors_response(Response(json.dumps(purchases_data, default=date_handler), content_type='application/json'))
         except Exception as e:
-            _logger.error(f"Error fetching finished goods inventory: {str(e)}")
+            _logger.error(f"Error fetching PO orders: {str(e)}")
             return cors_response(Response(json.dumps({'error': str(e)}), content_type='application/json', status=500))
+
+
+        
+        
+        
+    @http.route('/api/material_allocation', type='http', auth='none', methods=['GET'], csrf=False)
+    def get_material_allocation(self, **kwargs):
+        try:
+            # Authentication
+            auth_header = request.httprequest.headers.get('Authorization')
+            if not auth_header:
+                return cors_response(Response(json.dumps({'error': 'Missing Authorization header'}), content_type='application/json', status=401))
+            try:
+                user = authenticate_user(auth_header)
+            except Exception as e:
+                return cors_response(Response(json.dumps({'error': 'Authentication failed', 'details': str(e)}), content_type='application/json', status=401))
+
+            # Fetch material allocation data
+            products = request.env['product.product'].sudo().search([])
+         
+            
+            allocation_data = []
+            for product in products:
+                allocation_data.append({
+                    'Code': product.name or '',
+                    'Reference No': product.default_code or '',
+                    'Description': product.name,
+                    'Available Stock': product.qty_available,
+                    'Re Order level': product.reordering_min_qty if hasattr(product, 'reordering_min_qty') else 0,
+                    'Lead Time': product.sale_delay if hasattr(product, 'sale_delay') else 0,
+                    'Order Min': product.min_qty if hasattr(product, 'min_qty') else 0,
+                    'Unit Price': product.standard_price
+                    # Add other fields as needed
+                })
+
+            return cors_response(Response(json.dumps(allocation_data, default=date_handler), content_type='application/json'))
+        except Exception as e:
+            return cors_response(Response(json.dumps({'error': str(e)}), content_type='application/json', status=500))
+        
+
+    @http.route('/api/stock_move_lines', type='http', auth='none', methods=['GET'], csrf=False)
+    def get_stock_move_lines(self, **kwargs):
+        try:
+            # Authentication
+            auth_header = request.httprequest.headers.get('Authorization')
+            if not auth_header:
+                return cors_response(Response(json.dumps({'error': 'Missing Authorization header'}), content_type='application/json', status=401))
+            try:
+                user = authenticate_user(auth_header)
+            except Exception as e:
+                return cors_response(Response(json.dumps({'error': 'Authentication failed', 'details': str(e)}), content_type='application/json', status=401))
+
+            # Fetch stock move lines
+            move_lines = request.env['stock.move.line'].sudo().search([])
+            
+            move_line_data = []
+            for line in move_lines:
+                move_line_data.append({
+                    'reference': line.reference or '',
+                    'product': line.product_id.name if line.product_id else '',
+                    'product_code': line.product_id.default_code if line.product_id else '',
+                    'source_location': line.location_id.name if line.location_id else '',
+                    'destination_location': line.location_dest_id.name if line.location_dest_id else '',
+                    'quantity': line.quantity,
+                    'date': line.date,
+                    # Add other fields as needed
+                })
+
+            return cors_response(Response(json.dumps(move_line_data, default=date_handler), content_type='application/json'))
+        except Exception as e:
+            _logger.error(f"Error fetching stock move lines: {str(e)}")
+            return cors_response(Response(json.dumps({'error': str(e)}), content_type='application/json', status=500))        
