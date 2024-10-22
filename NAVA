@@ -1,0 +1,106 @@
+from odoo import http
+from odoo.http import request, Response
+import json
+from datetime import date, datetime
+import logging
+from .authentication import authenticate_user, cors_response
+
+_logger = logging.getLogger(__name__)
+
+def date_handler(obj):
+    if isinstance(obj, (date, datetime)):
+        return obj.isoformat()
+    raise TypeError("Type not serializable")
+
+class InventoryPurchasingController(http.Controller):
+
+    @http.route('/api/nava_inventary_purchasing', type='http', auth='none', methods=['GET'], csrf=False)
+    def get_inventory_purchasing(self, **kwargs):
+        try:
+            # Authentication
+            auth_header = request.httprequest.headers.get('Authorization')
+            if not auth_header:
+                return cors_response(Response(json.dumps({'error': 'Missing Authorization header'}), content_type='application/json', status=401))
+            try:
+                user = authenticate_user(auth_header)
+            except Exception as e:
+                return cors_response(Response(json.dumps({'error': 'Authentication failed', 'details': str(e)}), content_type='application/json', status=401))
+
+            # Fetch inventory items
+            stock_quants = request.env['stock.quant'].sudo().search([("product_categ_id", "=", 18)])
+            inventory_data = []
+
+            for quant in stock_quants:
+                product = quant.product_id
+                
+                # Get the last purchasing date
+                last_purchase = request.env['stock.move.line'].sudo().search([
+                    ('product_id', '=', product.id),
+                    ('picking_id.picking_type_id.code', '=', 'incoming')
+                ], order='date desc', limit=1)
+
+                item_data = {
+                    'Item Code': product.default_code,
+                    'Description': product.name,
+                    'Unit of Measure': quant.product_uom_id.name,
+                    'Category': quant.product_categ_id.name,
+                    'Origin': quant.origin or '',
+                    'MOQ': product.minimum_order_qty if hasattr(product, 'minimum_order_qty') else 0,
+                    'Lead Time': product.sale_delay,
+                    'QTY': quant.inventory_quantity_auto_apply,
+                    'Value': quant.value,
+                    'Last Purchasing Date': last_purchase.date if last_purchase else None
+                }
+                inventory_data.append(item_data)
+
+            return cors_response(Response(json.dumps(inventory_data, default=date_handler), content_type='application/json'))
+        except Exception as e:
+            _logger.error(f"Error fetching inventory purchasing data: {str(e)}")
+            return cors_response(Response(json.dumps({'error': str(e)}), content_type='application/json', status=500))
+        
+        
+    @http.route('/api/nava_finishing_goods', type='http', auth='none', methods=['GET'], csrf=False)
+    def get_finishing_goods(self, **kwargs):
+        try:
+            # Authentication
+            auth_header = request.httprequest.headers.get('Authorization')
+            if not auth_header:
+                return cors_response(Response(json.dumps({'error': 'Missing Authorization header'}), content_type='application/json', status=401))
+            try:
+                user = authenticate_user(auth_header)
+            except Exception as e:
+                return cors_response(Response(json.dumps({'error': 'Authentication failed', 'details': str(e)}), content_type='application/json', status=401))
+
+            # Fetch finishing goods
+            stock_quants = request.env['stock.quant'].sudo().search([("product_categ_id", "=", 17)])
+            finishing_goods_data = []
+
+            for quant in stock_quants:
+                product = quant.product_id
+
+                # Get the latest production order for this product
+                production_order = request.env['mrp.production'].sudo().search([
+                    ('product_id', '=', product.id)
+                ], order='create_date desc', limit=1)
+
+                # Get the latest stock move for this product
+                stock_move = request.env['stock.move'].sudo().search([
+                    ('product_id', '=', product.id)
+                ], order='create_date desc', limit=1)
+
+                item_data = {
+                    'Item Code': product.default_code,
+                    'Description': product.name,
+                    'Order No': production_order.origin if production_order else '',
+                    'Units': quant.product_uom_id.name,
+                    'Category': stock_move.description_picking if stock_move else '',
+                    'Ordered Qty': production_order.product_qty if production_order else 0,
+                    'On hand Qty': quant.inventory_quantity_auto_apply,
+                    'Shipped Qty': stock_move.quantity if stock_move else 0
+                }
+                finishing_goods_data.append(item_data)
+
+            return cors_response(Response(json.dumps(finishing_goods_data, default=date_handler), content_type='application/json'))
+        except Exception as e:
+            _logger.error(f"Error fetching finishing goods data: {str(e)}")
+            return cors_response(Response(json.dumps({'error': str(e)}), content_type='application/json', status=500))
