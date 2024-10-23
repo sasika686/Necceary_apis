@@ -26,9 +26,6 @@ class FinishedGoodsItemsController(http.Controller):
             except Exception as e:
                 return cors_response(Response(json.dumps({'error': 'Authentication failed', 'details': str(e)}), content_type='application/json', status=401))
 
-            # Get the stock.lot model to access created_date
-            StockLot = request.env['stock.lot'].sudo()
-            
             # Your main logic to fetch finished goods inventory
             items = request.env['stock.quant'].sudo().search([("location_id.usage", "=", "internal")])
             items_data = []
@@ -44,14 +41,13 @@ class FinishedGoodsItemsController(http.Controller):
                 cost = product_tmpl.standard_price
 
                 # Get lot information including creation date
-                lot_created_date = None
+                lot_create_date = None
                 if lot:
                     if hasattr(lot, 'expiration_date'):
                         expiration_date = lot.expiration_date.strftime('%Y-%m-%d') if lot.expiration_date else None
                     
-                    # Get lot record and its created_date
-                    lot_record = StockLot.browse(lot.id)
-                    lot_created_date = lot_record.create_date.strftime('%Y-%m-%d %H:%M:%S') if lot_record.created_date else None
+                    # Get create_date directly from lot record
+                    lot_create_date = lot.create_date.strftime('%Y-%m-%d %H:%M:%S') if lot.create_date else None
 
                 # Get location and parent location
                 location = line.location_id
@@ -62,7 +58,7 @@ class FinishedGoodsItemsController(http.Controller):
                     'Company Name': company.name,
                     'Product Category': product.categ_id.name,
                     'Lot No': lot.name if lot else None,
-                    'Lot Created Date': lot_created_date,
+                    'Lot Created Date': lot_create_date,
                     'Expiration Date': expiration_date,
                     'On_Hand_QTY': line.inventory_quantity_auto_apply,
                     'Reserved QTY': line.reserved_quantity,
