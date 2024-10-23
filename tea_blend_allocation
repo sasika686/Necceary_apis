@@ -1,0 +1,130 @@
+from odoo import http
+from odoo.http import request, Response
+from odoo.exceptions import AccessDenied
+import json
+from datetime import date, datetime
+import logging
+from odoo.addons.authentication.controllers.authentication import authenticate_user, cors_response # type: ignore
+from decimal import Decimal
+
+_logger = logging.getLogger(__name__)
+
+class CustomJSONEncoder(json.JSONEncoder):
+    def default(self, obj):
+        if isinstance(obj, (date, datetime)):
+            return obj.isoformat()
+        if isinstance(obj, Decimal):
+            return float(obj)
+        if hasattr(obj, '__dict__'):
+            return {k: self.default(v) for k, v in obj.__dict__.items()}
+        return str(obj)
+
+class TeaBlendAllocationController(http.Controller):
+    @http.route('/api/tea_blend_allocation', type='http', auth='none', methods=['GET'], csrf=False)
+    def get_tea_blend_allocation(self, **kwargs):
+        try:
+            # Authentication part
+            auth_header = request.httprequest.headers.get('Authorization')
+            if not auth_header:
+                return cors_response(Response(json.dumps({'error': 'Missing Authorization header'}), content_type='application/json', status=401))
+            try:
+                user = authenticate_user(auth_header)
+            except AccessDenied as e:
+                return cors_response(Response(json.dumps({'error': 'Authentication failed', 'details': str(e)}), content_type='application/json', status=401))
+
+            # Get pagination parameters from query string
+            limit = kwargs.get('limit', 100)  # Default limit is 100
+            offset = kwargs.get('offset', 0)  # Default offset is 0
+
+            # Validate and convert to integers
+            try:
+                limit = int(limit)
+                offset = int(offset)
+            except ValueError:
+                return cors_response(Response(json.dumps({'error': 'Invalid pagination parameters'}), content_type='application/json', status=400))
+
+            # Debug log before search
+            _logger.info("Starting tea auction lot search")
+            
+            # Fetch the records with pagination
+            tea_auction_lot_line = request.env['tea.auction.lot'].sudo().search([])
+            
+            # Debug log after search
+            _logger.info(f"Found {len(tea_auction_lot_line)} tea auction lot records")
+
+            if not tea_auction_lot_line:
+                # If no records found, return helpful error message
+                return cors_response(Response(json.dumps({
+                    'error': 'No records found',
+                    'message': 'The tea.auction.lot model is empty or inaccessible'
+                }), content_type='application/json', status=404))
+
+            # Get related product data
+            product_model = request.env['product.product'].sudo()
+
+            auction_data = []
+            for line in tea_auction_lot_line:
+                try:
+                    # Debug log for each record
+                    _logger.info(f"Processing record ID: {line.id}")
+                    
+                    # Get product description
+                    product = None
+                    if line.tea_standard_id:
+                        product = product_model.search([('default_code', '=', line.tea_standard_id.name)], limit=1)
+                    
+                    record_data = {
+                        'id': line.id,
+                        'Lot_No': line.lot_no,
+                        'Box_Num': line.box_number.name,
+                        'Standard': line.tea_standard_id.name if line.tea_standard_id else None,
+                        'Description': product.name if product else None,  # Added product description
+                        'Trader': line.trader_id.name if line.trader_id else None,
+                        'Trader_Code': line.trader_code,
+                        'Broker': line.broker_id.name if line.broker_id else None,
+                        'Garden_Mark': line.selling_mark,
+                        'Invoice_No': line.invoice_no,
+                        'Z': line.z,
+                        'Sale_Code': line.sale_code,
+                        'Break': line.category,
+                        'RP': line.rp,
+                        'RA': line.ra,
+                        'Certifications': line.certifications,
+                        'Bags': line.bags,
+                        'Net_Weight': line.net_weight,
+                        'Allocated_Qty': line.total_weight,
+                        'Asking_Price': line.asking_price,
+                        'Registered_Bid_Amount': line.registered_bid_amount,
+                        'Registered_Bid_Buyer_Code': line.registered_bid_buyer_code,
+                        'Registered_Bid_Buyer_Company': line.registered_bid_buyer_company,
+                        'Second_Highest_Bid_Amount': line.second_highest_bid_amount,
+                        'Second_Highest_Bid_Buyer_Code': line.second_highest_bid_buyer_code,
+                        'Total_Price': line.total_price,
+                        'Status': line.status,
+                        'Purchased_Price': line.purchased_price,
+                        'Final_Price': line.final_price,
+                        'Buyer': line.buyer,
+                        'Buyer_Name': line.buyer_name,
+                        'PO_Status': line.state_po,
+                    }
+                    auction_data.append(record_data)
+                    
+                except Exception as e:
+                    _logger.error(f"Error processing record {line.id}: {str(e)}", exc_info=True)
+                    continue
+
+            # Debug log for response
+            _logger.info(f"Preparing response with {len(auction_data)} records")
+
+            json_data = json.dumps(auction_data, cls=CustomJSONEncoder)
+            return cors_response(Response(json_data, content_type='application/json'))
+
+        except Exception as e:
+            _logger.error(f"Error in get_tea_blend_allocation: {str(e)}", exc_info=True)
+            request.env.cr.rollback()
+            error_response = Response(json.dumps({
+                'error': 'An unexpected error occurred',
+                'details': str(e),
+                'type': str(type(e))
+            }), content_type='application/json', status=500)
+            return cors_response(error_response)
