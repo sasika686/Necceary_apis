@@ -27,12 +27,17 @@ class InventoryPurchasingController(http.Controller):
                 return cors_response(Response(json.dumps({'error': 'Authentication failed', 'details': str(e)}), content_type='application/json', status=401))
 
             # Fetch inventory items
-            stock_quants = request.env['stock.quant'].sudo().search([("product_categ_id", "=", 18)])
+            stock_quants = request.env['stock.quant'].sudo().search([])
             inventory_data = []
 
             for quant in stock_quants:
                 product = quant.product_id
                 
+                # Get supplier info for MOQ and Lead Time
+                supplier_info = request.env['product.supplierinfo'].sudo().search([
+                    ('product_tmpl_id', '=', product.product_tmpl_id.id)
+                ], limit=1)
+
                 # Get the last purchasing date
                 last_purchase = request.env['stock.move.line'].sudo().search([
                     ('product_id', '=', product.id),
@@ -42,13 +47,12 @@ class InventoryPurchasingController(http.Controller):
                 item_data = {
                     'Item Code': product.default_code,
                     'Description': product.name,
-                    'Unit of Measure': quant.product_uom_id.name,
-                    'Category': quant.product_categ_id.name,
-                    'Origin': quant.origin or '',
-                    'MOQ': product.minimum_order_qty if hasattr(product, 'minimum_order_qty') else 0,
-                    'Lead Time': product.sale_delay,
-                    'QTY': quant.inventory_quantity_auto_apply,
-                    'Value': quant.value,
+                    'Unit of Measure': quant.product_uom_id.name if quant.product_uom_id else '',
+                    'Category': quant.product_id.categ_id.name if quant.product_id.categ_id else '',
+                    'MOQ': supplier_info.min_qty if supplier_info else 0,
+                    'Lead Time': supplier_info.delay if supplier_info else 0,
+                    'QTY': quant.inventory_quantity_auto_apply if quant.inventory_quantity_auto_apply else 0,
+                    'Value': quant.value if hasattr(quant, 'value') else 0,
                     'Last Purchasing Date': last_purchase.date if last_purchase else None
                 }
                 inventory_data.append(item_data)
@@ -57,6 +61,7 @@ class InventoryPurchasingController(http.Controller):
         except Exception as e:
             _logger.error(f"Error fetching inventory purchasing data: {str(e)}")
             return cors_response(Response(json.dumps({'error': str(e)}), content_type='application/json', status=500))
+    
         
         
     @http.route('/api/nava_finishing_goods', type='http', auth='none', methods=['GET'], csrf=False)
@@ -71,32 +76,38 @@ class InventoryPurchasingController(http.Controller):
             except Exception as e:
                 return cors_response(Response(json.dumps({'error': 'Authentication failed', 'details': str(e)}), content_type='application/json', status=401))
 
-            # Fetch finishing goods
-            stock_quants = request.env['stock.quant'].sudo().search([("product_categ_id", "=", 17)])
+            # Get stock location
+            stock_location = request.env.ref('stock.stock_location_stock').id
+
+            # Fetch all products with the correct context
+            products = request.env['product.product'].sudo().with_context(
+                location=stock_location,
+                compute_child=True
+            ).search([])
+            
             finishing_goods_data = []
 
-            for quant in stock_quants:
-                product = quant.product_id
+            for product in products:
+                # Get product with proper context for stock calculations
+                product_with_context = product.with_context(
+                    location=stock_location,
+                    compute_child=True
+                )
 
                 # Get the latest production order for this product
                 production_order = request.env['mrp.production'].sudo().search([
                     ('product_id', '=', product.id)
                 ], order='create_date desc', limit=1)
 
-                # Get the latest stock move for this product
-                stock_move = request.env['stock.move'].sudo().search([
-                    ('product_id', '=', product.id)
-                ], order='create_date desc', limit=1)
-
                 item_data = {
-                    'Item Code': product.default_code,
-                    'Description': product.name,
+                    'Item Code': product.default_code or '',
+                    'Description': product.name or '',
                     'Order No': production_order.origin if production_order else '',
-                    'Units': quant.product_uom_id.name,
-                    'Category': stock_move.description_picking if stock_move else '',
-                    'Ordered Qty': production_order.product_qty if production_order else 0,
-                    'On hand Qty': quant.inventory_quantity_auto_apply,
-                    'Shipped Qty': stock_move.quantity if stock_move else 0
+                    'Units': product.uom_id.name if product.uom_id else '',
+                    'Category': product.categ_id.name if product.categ_id else '',
+                    'Ordered Qty': production_order.product_qty if production_order else 0.0,
+                    'On hand Qty': float(product_with_context.qty_available),
+                    'Shipped Qty': float(product_with_context.outgoing_qty or 0.0)
                 }
                 finishing_goods_data.append(item_data)
 
