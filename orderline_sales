@@ -1,0 +1,57 @@
+from odoo import http
+from odoo.http import request, Response
+import json
+from datetime import date, datetime
+import logging
+from .authentication import authenticate_user, cors_response  # Import the authentication functions
+
+_logger = logging.getLogger(__name__)  # Set up Odoo's built-in logger
+
+def date_handler(obj):
+    if isinstance(obj, (date, datetime)):
+        return obj.isoformat()
+    raise TypeError("Type not serializable")
+
+class OrderlineSales(http.Controller):
+    @http.route('/api/orderline_sales', type='http', auth='none', methods=['GET'], csrf=False)
+    def get_orderline_sales(self, **kwargs):
+        try:
+            # Authenticate user
+            auth_header = request.httprequest.headers.get('Authorization')
+            if not auth_header:
+                return cors_response(Response(json.dumps({'error': 'Missing Authorization header'}), content_type='application/json', status=401))
+            try:
+                user = authenticate_user(auth_header)
+            except Exception as e:
+                return cors_response(Response(json.dumps({'error': 'Authentication failed', 'details': str(e)}), content_type='application/json', status=401))
+
+            # Fetch all pos.order.line records where the related order is not cancelled
+            order_lines = request.env['pos.order.line'].sudo().search([
+                ('order_id.state', '!=', 'cancel')
+            ])
+            
+            orderline_data = []
+            for line in order_lines:
+                # Fetch product data through the product_id relationship
+                product = line.product_id
+                company = line.company_id
+                
+                orderline_data.append({
+                    'Item Description': product.name,
+                    'QTY': line.qty,
+                    'Company Name': company.name,
+                    'Point of Sale': line.order_id.config_id.name,
+                    'Total Selling Price': line.price_subtotal_incl,
+                    'Invoice Month': line.create_date.strftime('%B'),
+                    'Invoice Number': line.order_id.name,
+                    'Hours': line.create_date.strftime('%H'),
+                    'Weekdays': line.create_date.strftime('%A'),
+                    'Category': product.categ_id.name,
+                    'Order Date': line.create_date.strftime('%Y-%m-%d'),
+                    'Order Time': line.create_date.strftime('%H:%M:%S'),
+                    'Customer Name': line.order_id.partner_id.name if line.order_id.partner_id else 'Unknown',
+                })
+            return cors_response(Response(json.dumps(orderline_data, default=date_handler), content_type='application/json'))
+        except Exception as e:
+            _logger.error(f"Error fetching furniture sales data: {str(e)}")
+            return cors_response(Response(json.dumps({'error': str(e)}), content_type='application/json', status=500))
