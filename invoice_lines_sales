@@ -1,0 +1,63 @@
+from odoo import http
+from odoo.http import request, Response
+import json
+from datetime import date, datetime
+import logging
+from .authentication import authenticate_user, cors_response
+
+_logger = logging.getLogger(__name__)
+
+def date_handler(obj):
+    if isinstance(obj, (date, datetime)):
+        return obj.isoformat()
+    raise TypeError("Type not serializable")
+
+class InvoiceLinesController(http.Controller):
+
+    @http.route('/api/invoice_lines', type='http', auth='none', methods=['GET'], csrf=False)
+    def get_invoice_lines(self, **kwargs):
+        try:
+            # Authenticate user
+            auth_header = request.httprequest.headers.get('Authorization')
+            if not auth_header:
+                return cors_response(Response(json.dumps({'error': 'Missing Authorization header'}), content_type='application/json', status=401))
+            try:
+                user = authenticate_user(auth_header)
+            except Exception as e:
+                return cors_response(Response(json.dumps({'error': 'Authentication failed', 'details': str(e)}), content_type='application/json', status=401))
+
+            # Get account.move.line records
+            move_lines = request.env['account.move.line'].sudo().search([
+                ('move_id.move_type', 'in', ['out_invoice', 'out_refund']),  # Filter for customer invoices
+                ('product_id', '!=', False)  # Only lines with products
+            ])
+            
+            lines_data = []
+            
+            for line in move_lines:
+                invoice = line.move_id  # Get the related invoice
+                
+                # Get the order reference
+                order_number = invoice.invoice_origin or None
+                
+                # Get salesperson information
+                salesperson = invoice.invoice_user_id
+                salesperson_data = {
+                    'id': salesperson.id,
+                    'name': salesperson.name
+                } if salesperson else None
+                
+                lines_data.append({
+                    'product_name': line.product_id.name if line.product_id else None,
+                    'quantity': float(line.quantity) if line.quantity else 0.0,
+                    'amount': float(line.price_total) if line.price_total else 0.0,
+                    'invoice_date': invoice.invoice_date.strftime('%Y-%m-%d') if invoice.invoice_date else None,
+                    'invoice_number': invoice.name if invoice.name else None,
+                    'order_number': order_number,
+                    'salesperson': salesperson_data
+                })
+
+            return cors_response(Response(json.dumps(lines_data, default=date_handler), content_type='application/json'))
+        except Exception as e:
+            _logger.error(f"Error fetching invoice lines: {str(e)}")
+            return cors_response(Response(json.dumps({'error': str(e)}), content_type='application/json', status=500))
