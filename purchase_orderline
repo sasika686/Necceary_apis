@@ -1,0 +1,62 @@
+from odoo import http
+from odoo.http import request, Response
+import json
+from datetime import date, datetime
+import logging
+from .authentication import authenticate_user, cors_response
+
+_logger = logging.getLogger(__name__)
+
+def date_handler(obj):
+    if isinstance(obj, (date, datetime)):
+        return obj.isoformat()
+    raise TypeError("Type not serializable")
+
+class PurchaseOrderlineSales(http.Controller):
+    @http.route('/api/purchase_orderline', type='http', auth='none', methods=['GET'], csrf=False)
+    def get_purchase_orderlines(self, **kwargs):
+        try:
+            # Authenticate user
+            auth_header = request.httprequest.headers.get('Authorization')
+            if not auth_header:
+                return cors_response(Response(json.dumps({'error': 'Missing Authorization header'}), 
+                                           content_type='application/json', status=401))
+            try:
+                user = authenticate_user(auth_header)
+            except Exception as e:
+                return cors_response(Response(json.dumps({'error': 'Authentication failed', 
+                                                       'details': str(e)}), 
+                                           content_type='application/json', status=401))
+
+            # Fetch all purchase.order.line records
+            purchase_lines = request.env['purchase.order.line'].sudo().search([])
+            
+            orderline_data = []
+            for line in purchase_lines:
+                # Get related product data
+                product = line.product_id
+                
+                orderline_data.append({
+                    'Product ID': product.default_code,
+                    'Product Description': product.name,
+                    'Expected Arrival': line.date_planned,
+                    'Quantity': line.product_qty,
+                    'Reserved Quantity': line.qty_received,
+                    'UOM': line.product_uom.name,
+                    'Unit Price': line.price_unit,
+                    'Total': line.price_subtotal,
+                    'Order No': line.order_id.name,
+                    # Additional useful fields
+                    'Vendor': line.order_id.partner_id.name,
+                    'Company': line.company_id.name,
+                    'Order Date': line.order_id.date_order,
+                    'State': line.order_id.state
+                })
+                
+            return cors_response(Response(json.dumps(orderline_data, default=date_handler), 
+                                       content_type='application/json'))
+                                       
+        except Exception as e:
+            _logger.error(f"Error fetching purchase order line data: {str(e)}")
+            return cors_response(Response(json.dumps({'error': str(e)}), 
+                                       content_type='application/json', status=500))
