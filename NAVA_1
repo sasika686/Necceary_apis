@@ -1,0 +1,178 @@
+from odoo import http
+from odoo.http import request, Response
+import json
+from datetime import date, datetime
+import logging
+from .authentication import authenticate_user, cors_response
+
+_logger = logging.getLogger(__name__)
+
+def date_handler(obj):
+    if isinstance(obj, (date, datetime)):
+        return obj.isoformat()
+    raise TypeError("Type not serializable")
+
+class NAVAInventoryController(http.Controller):
+
+    @http.route('/api/nava_material_stock', type='http', auth='none', methods=['GET'], csrf=False)
+    def get_material_stock(self, **kwargs):
+        try:
+            # Authentication
+            auth_header = request.httprequest.headers.get('Authorization')
+            if not auth_header:
+                return cors_response(Response(json.dumps({'error': 'Missing Authorization header'}), content_type='application/json', status=401))
+            try:
+                user = authenticate_user(auth_header)
+            except Exception as e:
+                return cors_response(Response(json.dumps({'error': 'Authentication failed', 'details': str(e)}), content_type='application/json', status=401))
+
+            # Get stock location
+            stock_location = request.env.ref('stock.stock_location_stock').id
+
+            # Fetch material stock items
+            stock_quants = request.env['stock.quant'].sudo().search([
+                ('location_id', '=', stock_location)
+            ])
+            
+            material_stock = []
+            for quant in stock_quants:
+                product = quant.product_id
+                
+                # Get supplier info
+                supplier_info = request.env['product.supplierinfo'].sudo().search([
+                    ('product_tmpl_id', '=', product.product_tmpl_id.id)
+                ], limit=1)
+
+                # Calculate aging based on receipt date
+                aging = ''  # Default aging category
+                if quant.in_date:
+                    days = (datetime.now().date() - quant.in_date.date()).days
+                    aging = self._calculate_aging_category(days)
+
+                item_data = {
+                    'Item Code': product.default_code or '',
+                    'Description': product.name,
+                    'Unit of Measure': quant.product_uom_id.name,
+                    'Category': product.categ_id.name,
+                    'Origin': product.country_of_origin if hasattr(product, 'country_of_origin') else '',
+                    'MOQ': supplier_info.min_qty if supplier_info else 0,
+                    'Lead Time': supplier_info.delay if supplier_info else 0,
+                    'QTY': float(quant.quantity),
+                    'Value': float(quant.value) if hasattr(quant, 'value') else 0.0,
+                    'Last Purchasing Date': quant.in_date.strftime('%Y-%m-%d'),
+                }
+                material_stock.append(item_data)
+
+            return cors_response(Response(json.dumps(material_stock, default=date_handler), content_type='application/json'))
+        except Exception as e:
+            _logger.error(f"Error fetching material stock: {str(e)}")
+            return cors_response(Response(json.dumps({'error': str(e)}), content_type='application/json', status=500))
+
+    @http.route('/api/nava_finished_goods', type='http', auth='none', methods=['GET'], csrf=False)
+    def get_finished_goods(self, **kwargs):
+        try:
+            # Authentication
+            auth_header = request.httprequest.headers.get('Authorization')
+            if not auth_header:
+                return cors_response(Response(json.dumps({'error': 'Missing Authorization header'}), 
+                                content_type='application/json', status=401))
+            try:
+                user = authenticate_user(auth_header)
+            except Exception as e:
+                return cors_response(Response(json.dumps({'error': 'Authentication failed', 'details': str(e)}), 
+                                content_type='application/json', status=401))
+            
+            # Get stock location
+            stock_location = request.env.ref('stock.stock_location_stock').id
+            
+            # Fetch finished goods orders
+            finished_goods_orders = request.env['stock.picking'].sudo().search([
+                ('picking_type_id.code', '=', 'outgoing'),
+                ('state', 'not in', ['done', 'cancel'])
+            ])
+            
+            finished_goods = []
+            for order in finished_goods_orders:
+                for move in order.move_ids:
+                    product = move.product_id
+                    
+                    # Calculate total delivered quantity from move lines
+                    delivered_qty = sum(move.move_line_ids.mapped('qty_delivered'))
+                    
+                    item_data = {
+                        'description': product.name,
+                        'order_no': order.name,
+                        'units': move.product_uom.name,
+                        'category': product.categ_id.name,
+                        'ordered': float(move.product_uom_qty),
+                        'on_hand': float(product.with_context(location=stock_location).qty_available),
+                        'shipped': float(delivered_qty)  # Using sum of qty_done from move lines
+                    }
+                    finished_goods.append(item_data)
+            
+            return cors_response(Response(json.dumps(finished_goods, default=date_handler), 
+                            content_type='application/json'))
+        except Exception as e:
+            _logger.error(f"Error fetching finished goods: {str(e)}")
+            return cors_response(Response(json.dumps({'error': str(e)}), 
+                            content_type='application/json', status=500))
+
+    @http.route('/api/nava_material_value_by_year', type='http', auth='none', methods=['GET'], csrf=False)
+    def get_material_value_by_year(self, **kwargs):
+        try:
+            # Authentication
+            auth_header = request.httprequest.headers.get('Authorization')
+            if not auth_header:
+                return cors_response(Response(json.dumps({'error': 'Missing Authorization header'}), content_type='application/json', status=401))
+            try:
+                user = authenticate_user(auth_header)
+            except Exception as e:
+                return cors_response(Response(json.dumps({'error': 'Authentication failed', 'details': str(e)}), content_type='application/json', status=401))
+
+            # Get stock moves by year
+            stock_moves = request.env['stock.move'].sudo().search([
+                ('state', '=', 'done'),
+                ('picking_type_id.code', '=', 'incoming')
+            ])
+            
+            yearly_data = {}
+            for move in stock_moves:
+                year = move.date.year
+                if year not in yearly_data:
+                    yearly_data[year] = {
+                        'A 0-30': 0.0,
+                        'B 31-60': 0.0,
+                        'C 61-90': 0.0,
+                        'D 91-120': 0.0,
+                        'E 121-180': 0.0,
+                        'F 181-365': 0.0,
+                        'G >365': 0.0
+                    }
+                
+                # Calculate aging and value
+                days = (datetime.now().date() - move.date.date()).days
+                aging_category = self._calculate_aging_category(days)
+                value = float(move.product_id.standard_price * move.product_uom_qty)
+                
+                yearly_data[year][aging_category] += value
+
+            return cors_response(Response(json.dumps(yearly_data, default=date_handler), content_type='application/json'))
+        except Exception as e:
+            _logger.error(f"Error fetching material value by year: {str(e)}")
+            return cors_response(Response(json.dumps({'error': str(e)}), content_type='application/json', status=500))
+
+    def _calculate_aging_category(self, days):
+        if 0 <= days <= 30:
+            return 'A 0-30'
+        elif 31 <= days <= 60:
+            return 'B 31-60'
+        elif 61 <= days <= 90:
+            return 'C 61-90'
+        elif 91 <= days <= 120:
+            return 'D 91-120'
+        elif 121 <= days <= 180:
+            return 'E 121-180'
+        elif 181 <= days <= 365:
+            return 'F 181-365'
+        else:
+            return 'G >365'
