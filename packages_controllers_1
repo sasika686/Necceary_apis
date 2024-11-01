@@ -1,0 +1,188 @@
+from odoo import http , fields
+from odoo.http import request, Response
+from odoo.exceptions import ValidationError, AccessDenied
+from odoo.tools import float_round
+import logging
+from collections import defaultdict
+import json
+import math 
+
+_logger = logging.getLogger(__name__)
+
+
+class TeaPackageControllers(http.Controller):
+    def _authenticate(self, auth_header):
+        """Authenticate user using Bearer token"""
+        if not auth_header or not auth_header.startswith('Bearer '):
+            raise AccessDenied('Invalid or missing Bearer token')
+        
+        token = auth_header.split(' ')[1]
+        api_key_sudo = request.env['res.users.apikeys'].sudo()
+        user_id = api_key_sudo._check_credentials(scope="rpc", key=token)
+        if not user_id:
+            raise AccessDenied('Invalid Bearer token')
+        
+        return request.env['res.users'].sudo().browse(user_id)
+
+    def _cors_response(self, response):
+        """Add CORS headers to the response"""
+        response.headers['Access-Control-Allow-Origin'] = '*'
+        response.headers['Access-Control-Allow-Methods'] = 'GET, POST, PUT, DELETE, OPTIONS'
+        response.headers['Access-Control-Allow-Headers'] = 'Origin, X-Requested-With, Content-Type, Accept, Authorization'
+        return response
+
+    @http.route('/api/tea/lot/packages_controllers', type='http', auth='none', methods=['GET', 'OPTIONS'], csrf=False)
+    def get_lot_packages(self, **kw):
+        if request.httprequest.method == 'OPTIONS':
+            return self._cors_response(Response())
+        
+        try:
+            auth_header = request.httprequest.headers.get('Authorization')
+            user = self._authenticate(auth_header)
+            
+            # Get ID parameter
+            package_id = kw.get('id')
+            lot_ids = kw.get('lot_ids')
+            filters = []
+            params = []
+            
+            if package_id:
+                filters.append('AND sqp.id = %s')
+                params.append(int(package_id))
+                
+            if lot_ids:
+                lot_ids = [int(x) for x in lot_ids.split(',') if x.isdigit()]
+                if lot_ids:
+                    filters.append('AND sl.id IN %s')
+                    params.append(tuple(lot_ids))
+                    
+            lot_filter = ' '.join(filters)
+            
+            query = """
+                WITH package_quantities AS (
+                    SELECT 
+                        sqp.id as package_id,
+                        sqp.name as package_name,
+                        COALESCE(sqp.package_unit_quantity, 0.0) as package_unit_quantity,
+                        sl.id as lot_id,
+                        sl.name as lot_name,
+                        pp.id as product_id,
+                        pt.name->>'en_US' as product_name,
+                        COALESCE(SUM(sq.quantity), 0.0) as total_quantity,
+                        COUNT(CASE WHEN sqp.tea_blend_id IS NOT NULL THEN 1 END) as allocated_packages,
+                        COALESCE(SUM(CASE WHEN sqp.tea_blend_id IS NOT NULL THEN sq.quantity ELSE 0 END), 0.0) as allocated_quantity,
+                        tal.broker_id,
+                        rp.name as broker_name,
+                        tal.lot_no,
+                        tal.selling_mark,
+                        tal.grade,
+                        tal.invoice_no,
+                        tal.purchased_price,
+                        tal.total_weight
+                    FROM stock_quant_package sqp
+                    JOIN stock_quant sq ON sq.package_id = sqp.id
+                    JOIN stock_lot sl ON sq.lot_id = sl.id
+                    JOIN product_product pp ON sq.product_id = pp.id
+                    JOIN product_template pt ON pp.product_tmpl_id = pt.id
+                    LEFT JOIN box_number bn ON bn.name = sl.name
+                    LEFT JOIN tea_auction_lot tal ON tal.box_number = bn.id
+                    LEFT JOIN res_partner rp ON tal.broker_id = rp.id
+                    WHERE 1=1
+                    {lot_filter}
+                    GROUP BY 
+                        sqp.id, sqp.name, sqp.package_unit_quantity,
+                        sl.id, sl.name,
+                        pp.id, pt.name,
+                        tal.broker_id, rp.name,
+                        tal.lot_no, tal.selling_mark, tal.grade,
+                        tal.invoice_no, tal.purchased_price,
+                        tal.total_weight
+                    HAVING COALESCE(SUM(sq.quantity), 0.0) > 0
+                )
+                SELECT 
+                    lot_id,
+                    lot_name,
+                    product_id,
+                    product_name,
+                    package_unit_quantity,
+                    COUNT(package_id) as package_count,
+                    SUM(total_quantity) as total_qty,
+                    array_agg(package_id) as package_ids,
+                    SUM(allocated_packages) as total_allocated_packages,
+                    SUM(allocated_quantity) as total_allocated_quantity,
+                    broker_id,
+                    broker_name,
+                    lot_no,
+                    selling_mark,
+                    grade,
+                    invoice_no,
+                    purchased_price,
+                    total_weight
+                FROM package_quantities
+                GROUP BY 
+                    lot_id, lot_name,
+                    product_id, product_name,
+                    package_unit_quantity,
+                    broker_id, broker_name,
+                    lot_no, selling_mark, grade,
+                    invoice_no, purchased_price,
+                    total_weight
+                HAVING COUNT(package_id) > 0
+                ORDER BY lot_name, package_unit_quantity;
+            """.format(lot_filter=lot_filter)
+            
+            request.cr.execute(query, params)
+            query_result = request.cr.dictfetchall()
+            
+            if not query_result:
+                error_message = 'No free packages found'
+                if lot_ids:
+                    error_message += f' for lots: {", ".join(map(str, lot_ids))}'
+                if package_id:
+                    error_message += f' for package ID: {package_id}'
+                return self._cors_response(Response(
+                    json.dumps({'error': error_message}),
+                    content_type='application/json',
+                    status=404
+                ))
+            
+            result = []
+            for row in query_result:
+                # Ensure we have numeric values and handle potential NULL values
+                package_unit_qty = float(row['package_unit_quantity'] or 0.0)
+                total_qty = float(row['total_qty'] or 0.0)
+                free_packages = int(row['package_count'] or 0)
+                allocated_packages = int(row['total_allocated_packages'] or 0)
+                allocated_quantity = float(row['total_allocated_quantity'] or 0.0)
+                
+                result.append({
+                    'standard': row['product_name'],
+                    'blend_standard_id': row['product_id'],
+                    'box_number': row['lot_name'],
+                    'id': row['lot_id'],
+                    'net_weight': float_round(package_unit_qty, precision_digits=3),
+                    'free_packages': free_packages,
+                    'free_quantity': float_round(total_qty, precision_digits=3),
+                    'allocated_packages': allocated_packages,
+                    'allocated_quantity': float_round(allocated_quantity, precision_digits=3),
+                    'package_ids': row['package_ids'],
+                    'garden_mark': row['selling_mark'],
+                    'grade': row['grade'],
+                    'sample_allowance': "",
+                    'Total Weight': row['total_weight'],
+                    'purchased_price': row['purchased_price'],
+                    'break': "Leafy",
+                    'invoice_no': row['invoice_no'],
+                    'blend_line_type': "STRLN",
+                    'broker_id': row['broker_id'],
+                    'broker_name': row['broker_name'],
+                    'lot_no': row['lot_no'],
+                })
+                    
+            return self._cors_response(Response(json.dumps(result), content_type='application/json'))
+            
+        except AccessDenied as e:
+            return self._cors_response(Response(json.dumps({'error': str(e)}), content_type='application/json', status=401))
+        except Exception as e:
+            _logger.error(f"Error in get_lot_packages: {str(e)}")
+            return self._cors_response(Response(json.dumps({'error': str(e)}), content_type='application/json', status=500))
