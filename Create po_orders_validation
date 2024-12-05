@@ -1,0 +1,226 @@
+from odoo import http
+from odoo.http import request, Response
+import json
+from datetime import date, datetime
+import logging
+from .authentication import authenticate_user, cors_response
+
+_logger = logging.getLogger(__name__)
+
+def date_handler(obj):
+    if isinstance(obj, (date, datetime)):
+        return obj.isoformat()
+    raise TypeError("Type not serializable")
+
+class POOrdersController(http.Controller):
+
+    @http.route('/api/po_orders', type='http', auth='none', methods=['GET'], csrf=False)
+    def get_po_orders(self, **kwargs):
+        try:
+            # Authentication
+            auth_header = request.httprequest.headers.get('Authorization')
+            if not auth_header:
+                return cors_response(Response(json.dumps({'error': 'Missing Authorization header'}), content_type='application/json', status=401))
+            try:
+                user = authenticate_user(auth_header)
+            except Exception as e:
+                return cors_response(Response(json.dumps({'error': 'Authentication failed', 'details': str(e)}), content_type='application/json', status=401))
+
+            # Fetch purchase orders
+            purchases = request.env['purchase.order'].sudo().search([])
+            purchases_data = []
+            for purchase in purchases:
+                po_data = {
+                    'PO No': purchase.name or '',
+                    'Invoice No': ', '.join(purchase.invoice_ids.mapped('name')),
+                    'Supplier Name': purchase.partner_id.name or '',
+                    'Order Date': purchase.date_order,
+                    'PO Cost': purchase.amount_total,
+                    "State" : purchase.state,
+                    'Items': [],
+                    'Reference Numbers': []
+                }
+                
+                has_products = False
+                for line in purchase.order_line:
+                    # Get product code with fallback to internal reference or empty string
+                    product_code = line.product_id.default_code
+                    if not product_code:
+                        product_code = line.product_id.name or ''
+                        
+                    item_data = {
+                        'Item Code': product_code,
+                        'Item Description': line.name or '',
+                        'Item Cost': line.price_unit,
+                        'Ordered Qty': line.product_qty,
+                        'Has Products': line.product_id.type != 'service'
+                    }
+                    po_data['Items'].append(item_data)
+                    
+                    if line.product_id.type != 'service':
+                        has_products = True
+
+                if has_products:
+                    stock_moves = request.env['stock.move.line'].sudo().search([('picking_id.purchase_id', '=', purchase.id)])
+                    reference_numbers = set(stock_moves.mapped('picking_id.name'))
+                    po_data['Reference Numbers'] = list(reference_numbers)
+
+                purchases_data.append(po_data)
+
+            return cors_response(Response(json.dumps(purchases_data, default=date_handler), content_type='application/json'))
+        except Exception as e:
+            _logger.error(f"Error fetching PO orders: {str(e)}")
+            return cors_response(Response(json.dumps({'error': str(e)}), content_type='application/json', status=500))
+
+    @http.route('/api/manufacturing_orders_po', type='http', auth='none', methods=['GET'], csrf=False)
+    def get_material_allocation(self, **kwargs):
+        try:
+            # Authentication
+            auth_header = request.httprequest.headers.get('Authorization')
+            if not auth_header:
+                return cors_response(Response(json.dumps({'error': 'Missing Authorization header'}), content_type='application/json', status=401))
+            try:
+                user = authenticate_user(auth_header)
+            except Exception as e:
+                return cors_response(Response(json.dumps({'error': 'Authentication failed', 'details': str(e)}), content_type='application/json', status=401))
+
+            mo_records = request.env['mrp.production'].sudo().search([])
+            mo_data = []
+            
+            for mo in mo_records:
+                product = mo.product_id.sudo()
+                lot_number = mo.lot_producing_id.name if mo.lot_producing_id else None
+                
+                # Get supplier information from product.supplierinfo
+                supplier_info = request.env['product.supplierinfo'].sudo().search([
+                    ('product_tmpl_id', '=', product.product_tmpl_id.id)
+                ], limit=1)
+                
+                # Get stock quant for on-hand quantity
+                quants = request.env['stock.quant'].sudo().search([
+                    ('product_id', '=', product.id),
+                    ('location_id.usage', '=', 'internal')
+                ])
+                on_hand_qty = sum(quants.mapped('quantity'))
+
+                # Get product price from product.product
+                product_with_price = request.env['product.product'].sudo().browse(product.id)
+                unit_price = product_with_price.lst_price or 0.0
+
+                order_data = {
+                    'manufacturing_order_reference': mo.name,
+                    'product_name': product.name,
+                    'product_code': product.default_code or '',
+                    'category': product.categ_id.name or '',
+                    'quantity_to_produce': mo.product_qty,
+                    'bom_id': mo.bom_id.id,
+                    'origin': mo.origin,
+                    'unit_of_measure': product.uom_id.name,
+                    'lot_serial_number': lot_number,
+                    'state': mo.state,
+                    'lead_time': supplier_info.delay if supplier_info else 0,
+                    'order_min': supplier_info.min_qty if supplier_info else 0,
+                    'on_hand_quantity': float(on_hand_qty),
+                    'unit_price': float(unit_price)
+                }
+                mo_data.append(order_data)
+
+            return cors_response(Response(json.dumps(mo_data, default=date_handler), content_type='application/json'))
+        except Exception as e:
+            _logger.error(f"Error fetching material allocation: {str(e)}")
+            return cors_response(Response(json.dumps({'error': str(e)}), content_type='application/json', status=500))
+                
+    @http.route('/api/sales_details_po', type='http', auth='none', methods=['GET'], csrf=False)
+    def get_sales_orderline(self, **kwargs):
+        try:
+            # Authenticate user
+            auth_header = request.httprequest.headers.get('Authorization')
+            if not auth_header:
+                return cors_response(Response(json.dumps({'error': 'Missing Authorization header'}), content_type='application/json', status=401))
+            try:
+                user = authenticate_user(auth_header)
+            except Exception as e:
+                return cors_response(Response(json.dumps({'error': 'Authentication failed', 'details': str(e)}), content_type='application/json', status=401))
+
+            # Fetch all sale.order.line records
+            order_lines = request.env['sale.order.line'].sudo().search([])
+            
+            sales_data = []
+            for line in order_lines:
+                # Get related records
+                product = line.product_id
+                order = line.order_id
+                
+                sales_data.append({
+                    # Product Information
+                    'Product Description': product.name,
+                    'Product Code': product.default_code,
+                    'Product Category': product.categ_id.name,
+                    'Product Variant ID': product.product_variant_id.name if product.product_variant_id else None,
+                    
+                    # Order Information
+                    'Order No': order.name,
+                    'Order Date': order.date_order,
+                    'Customer Ref': order.client_order_ref,
+                    'Units': line.product_uom.name,
+                    'Order Qty': line.product_uom_qty,
+                    'Delivered Qty': line.qty_delivered,
+                    
+                    # Pricing Information
+                    'Unit Price': line.price_unit,
+                    'Total': line.price_subtotal,
+                    'Price List': order.pricelist_id.name if order.pricelist_id else None,
+                    
+                    # Customer and Sales Team Information
+                    'Customer Name': order.partner_id.name if order.partner_id else 'Unknown',
+                    'Sales Person': order.user_id.name if order.user_id else None,
+                    'Sales Team': order.team_id.name if order.team_id else None,
+                    
+                    # Additional Useful Information
+                    'Company': order.company_id.name,
+                    'Discount': line.discount,
+                })
+                
+            return cors_response(Response(json.dumps(sales_data, default=date_handler), content_type='application/json'))
+            
+        except Exception as e:
+            _logger.error(f"Error fetching sales order line data: {str(e)}")
+            return cors_response(Response(json.dumps({'error': str(e)}), content_type='application/json', status=500))
+        
+        
+    @http.route('/api/bom_details', type='http', auth='none', methods=['GET'], csrf=False)
+    def get_bom_details(self, **kwargs):
+        try:
+            # Authenticate user
+            auth_header = request.httprequest.headers.get('Authorization')
+            if not auth_header:
+                return cors_response(Response(json.dumps({'error': 'Missing Authorization header'}), content_type='application/json', status=401))
+            try:
+                user = authenticate_user(auth_header)
+            except Exception as e:
+                return cors_response(Response(json.dumps({'error': 'Authentication failed', 'details': str(e)}), content_type='application/json', status=401))
+
+            # Fetch BOM records first
+            bom_records = request.env['mrp.bom'].sudo().search([])
+            
+            bom_data = []
+            for bom in bom_records:
+                for line in bom.bom_line_ids:
+                    bom_line_info = {
+                        'BOM ID': bom.product_tmpl_id.id,  # Get template ID from BOM record
+                        'BOM Name': bom.product_tmpl_id.name,
+                        'Component Code': line.product_id.default_code,
+                        'Component Name': line.product_id.name,
+                        'Component Qty': line.product_qty,
+                        'Unit': line.product_uom_id.name,
+                        'BOM Reference': bom.code or '',
+                        'BOM Type': bom.type,
+                        'Product Variant': line.product_id.name_get()[0][1] if line.product_id else '',
+                    }
+                    bom_data.append(bom_line_info)
+                    
+            return cors_response(Response(json.dumps(bom_data, default=date_handler), content_type='application/json'))
+            
+        except Exception as e:
+            _logger.error(f"Error fetching BOM data: {str(e)}")
+            return cors_response(Response(json.dumps({'error': str(e)}), content_type='application/json', status=500))
