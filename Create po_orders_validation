@@ -224,3 +224,134 @@ class POOrdersController(http.Controller):
         except Exception as e:
             _logger.error(f"Error fetching BOM data: {str(e)}")
             return cors_response(Response(json.dumps({'error': str(e)}), content_type='application/json', status=500))
+        
+            
+    @http.route('/api/combined_sales_bom', type='http', auth='none', methods=['GET'], csrf=False)
+    def get_combined_sales_bom(self, **kwargs):
+        try:
+            # Authenticate user
+            auth_header = request.httprequest.headers.get('Authorization')
+            if not auth_header:
+                return cors_response(Response(json.dumps({'error': 'Missing Authorization header'}), content_type='application/json', status=401))
+            try:
+                user = authenticate_user(auth_header)
+            except Exception as e:
+                return cors_response(Response(json.dumps({'error': 'Authentication failed', 'details': str(e)}), content_type='application/json', status=401))
+
+            # Fetch all sale.order.line records
+            order_lines = request.env['sale.order.line'].sudo().search([])
+
+            combined_data = []
+            for line in order_lines:
+                # Get related records
+                product = line.product_id
+                order = line.order_id
+                bom_records = request.env['mrp.bom'].sudo().search([('product_tmpl_id', '=', product.product_tmpl_id.id)])
+
+                # Gather BOM details for the product
+                bom_data = []
+                for bom in bom_records:
+                    for bom_line in bom.bom_line_ids:
+                        # Fetch the on-hand quantity for the component
+                        component_product = bom_line.product_id
+                        onhand_qty = component_product.with_context(warehouse=order.warehouse_id.id).qty_available
+
+                        # Get supplier information for the component
+                        supplier_info = request.env['product.supplierinfo'].sudo().search([
+                            ('product_tmpl_id', '=', component_product.product_tmpl_id.id)
+                        ], limit=1)
+
+                        bom_data.append({
+                            'Component Code': component_product.default_code,
+                            'Component Name': component_product.name,
+                            'Component Qty': bom_line.product_qty  * line.product_uom_qty,
+                            'Component Unit': bom_line.product_uom_id.name,
+                            'On-hand Qty': onhand_qty,
+                            'Lead Time': supplier_info.delay if supplier_info else 0,
+                            'Order Minimum': supplier_info.min_qty if supplier_info else 0
+                        })
+
+                # Append the combined data
+                combined_data.append({
+                    # Product Information
+                    'Product Description': product.name,
+                    'Product Code': product.default_code,
+                    'Product Category': product.categ_id.name,
+                    'Product Variant ID': product.product_variant_id.name if product.product_variant_id else None,
+
+                    # Order Information
+                    'Order No': order.name,
+                    'Order Date': order.date_order,
+                    'Customer Ref': order.client_order_ref,
+                    'Units': line.product_uom.name,
+                    'Order Qty': line.product_uom_qty,
+                    'Delivered Qty': line.qty_delivered,
+
+                    # Pricing Information
+                    'Unit Price': line.price_unit,
+                    'Total': line.price_subtotal,
+                    'Price List': order.pricelist_id.name if order.pricelist_id else None,
+
+                    # Customer and Sales Team Information
+                    'Customer Name': order.partner_id.name if order.partner_id else 'Unknown',
+                    'Sales Person': order.user_id.name if order.user_id else None,
+                    'Sales Team': order.team_id.name if order.team_id else None,
+
+                    # BOM Details
+                    'BOM Details': bom_data
+                })
+
+            return cors_response(Response(json.dumps(combined_data, default=date_handler), content_type='application/json'))
+
+        except Exception as e:
+            _logger.error(f"Error fetching combined sales order and BOM data: {str(e)}")
+            return cors_response(Response(json.dumps({'error': str(e)}), content_type='application/json', status=500))
+        
+    @http.route('/api/product_details', type='http', auth='none', methods=['GET'], csrf=False)
+    def get_product_details(self, **kwargs):
+        try:
+            # Authenticate user
+            auth_header = request.httprequest.headers.get('Authorization')
+            if not auth_header:
+                return cors_response(Response(json.dumps({'error': 'Missing Authorization header'}), content_type='application/json', status=401))
+            try:
+                user = authenticate_user(auth_header)
+            except Exception as e:
+                return cors_response(Response(json.dumps({'error': 'Authentication failed', 'details': str(e)}), content_type='application/json', status=401))
+
+            # Fetch all product.product records
+            products = request.env['product.product'].sudo().search([])
+
+            product_data = []
+            for product in products:
+                # Fetch the currency record for the product
+                currency = product.currency_id
+
+                # Get the on-hand quantity from the stock.quant model
+                stock_quants = request.env['stock.quant'].sudo().search([
+                    ('product_id', '=', product.id),
+                    ('location_id.usage', '=', 'internal')
+                ])
+                on_hand_qty = sum(quant.quantity for quant in stock_quants)
+
+                # Calculate the total value
+                total_value = on_hand_qty * product.standard_price
+
+                product_details = {
+                    'Default Code': product.default_code,
+                    'Display Name': product.display_name,
+                    'Average Cost': product.standard_price,
+                    'Total Value': total_value,
+                    'On-hand Qty': on_hand_qty,
+                    'Incoming Qty': product.incoming_qty,
+                    'Outgoing Qty': product.outgoing_qty,
+                    'Virtual Available': product.virtual_available,
+                    'Currency': currency.name
+                }
+                product_data.append(product_details)
+
+            return cors_response(Response(json.dumps(product_data, default=date_handler), content_type='application/json'))
+
+        except Exception as e:
+            _logger.error(f"Error fetching product details: {str(e)}")
+            return cors_response(Response(json.dumps({'error': str(e)}), content_type='application/json', status=500))
