@@ -1,0 +1,109 @@
+@http.route('/api/nava_material_stock', type='http', auth='none', methods=['GET'], csrf=False)
+def get_material_stock(self, **kw):
+    try:
+        # Authentication
+        auth_header = request.httprequest.headers.get('Authorization')
+        user_id = self._authenticate(auth_header)
+        env = request.env(user=user_id)
+        
+        query = """
+        WITH supplier_info AS (
+            SELECT 
+                pt.id as product_tmpl_id,
+                MIN(ps.min_qty) as moq,
+                MIN(ps.delay) as lead_time
+            FROM product_template pt
+            LEFT JOIN product_supplierinfo ps ON ps.product_tmpl_id = pt.id
+            GROUP BY pt.id
+        ),
+        latest_valuation AS (
+            SELECT 
+                svl.product_id,
+                svl.lot_id,
+                COALESCE(svl.unit_cost, 0.0) as unit_cost
+            FROM stock_valuation_layer svl
+            WHERE svl.id IN (
+                SELECT MAX(id)
+                FROM stock_valuation_layer
+                WHERE product_id IS NOT NULL
+                GROUP BY product_id, lot_id
+            )
+        )
+        SELECT 
+            pp.default_code as item_code,
+            pt.name as description,
+            uom.name as unit_of_measure,
+            pc.name as category,
+            sl.name as location,
+            sl.complete_name as location_complete_name,
+            COALESCE(lot.name, '') as lot_no,
+            COALESCE(si.moq, 0) as moq,
+            COALESCE(si.lead_time, 0) as lead_time,
+            COALESCE(sq.inventory_quantity_auto_apply, 0) as on_hand_qty,
+            COALESCE(sq.reserved_quantity, 0) as reserved_qty,
+            COALESCE(sq.value, 0.0) as value,
+            COALESCE(lv.unit_cost, 0.0) as unit_cost,
+            COALESCE(sq.inventory_quantity_auto_apply - sq.reserved_quantity, 0) as available_to_ship,
+            COALESCE(sq.in_date::date, CURRENT_DATE) as inventory_in_date
+        FROM stock_quant sq
+        JOIN product_product pp ON sq.product_id = pp.id
+        JOIN product_template pt ON pp.product_tmpl_id = pt.id
+        JOIN uom_uom uom ON pt.uom_id = uom.id
+        JOIN product_category pc ON pt.categ_id = pc.id
+        JOIN stock_location sl ON sq.location_id = sl.id
+        LEFT JOIN stock_lot lot ON sq.lot_id = lot.id
+        LEFT JOIN supplier_info si ON si.product_tmpl_id = pt.id
+        LEFT JOIN latest_valuation lv ON lv.product_id = pp.id AND 
+            (lv.lot_id = sq.lot_id OR (lv.lot_id IS NULL AND sq.lot_id IS NULL))
+        ORDER BY pp.default_code, sl.complete_name, lot.name
+        """
+        
+        env.cr.execute(query)
+        results = env.cr.dictfetchall()
+        
+        if not results:
+            return self._cors_response(Response(
+                json.dumps({'error': 'No stock items found'}),
+                content_type='application/json',
+                status=404
+            ))
+        
+        response_data = []
+        for row in results:
+            item = {
+                'Item Code': row['item_code'] or '',
+                'Description': row['description'],
+                'Unit of Measure': row['unit_of_measure'],
+                'Category': row['category'],
+                'Location': row['location'],
+                'Location Complete Name': row['location_complete_name'],
+                'Lot No': row['lot_no'],
+                'MOQ': float(row['moq']),
+                'Lead Time': int(row['lead_time']),
+                'On Hand QTY': float(row['on_hand_qty']),
+                'Reserved QTy': float(row['reserved_qty']),
+                'Value': float(row['value']),
+                'Unit Cost': float(row['unit_cost']),
+                'available_to_ship': float(row['available_to_ship']),
+                'Inventory In Date': row['inventory_in_date'].strftime('%Y-%m-%d')
+            }
+            response_data.append(item)
+            
+        return self._cors_response(Response(
+            json.dumps(response_data),
+            content_type='application/json'
+        ))
+        
+    except AccessDenied as e:
+        return self._cors_response(Response(
+            json.dumps({'error': str(e)}),
+            content_type='application/json',
+            status=401
+        ))
+    except Exception as e:
+        _logger.error(f"Error in get_material_stock: {str(e)}")
+        return self._cors_response(Response(
+            json.dumps({'error': str(e)}),
+            content_type='application/json',
+            status=500
+        ))
