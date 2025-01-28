@@ -1,0 +1,419 @@
+from odoo import http
+from odoo.http import request, Response
+import json
+from datetime import date, datetime
+from .authentication import authenticate_user, cors_response
+import logging
+
+_logger = logging.getLogger(__name__)
+
+def date_handler(obj):
+    if isinstance(obj, (date, datetime)):
+        return obj.isoformat()
+    raise TypeError("Type not serializable")
+
+class StockAgingReportController(http.Controller):
+    @http.route('/api/stock_aging', type='http', auth='none', methods=['GET'], csrf=False)
+    def get_stock_aging(self, **kwargs):
+        try:
+            # Authentication
+            auth_header = request.httprequest.headers.get('Authorization')
+            if not auth_header:
+                return cors_response(Response(json.dumps({'error': 'Missing Authorization header'}), 
+                                           content_type='application/json', status=401))
+            try:
+                user = authenticate_user(auth_header)
+            except Exception as e:
+                return cors_response(Response(json.dumps({'error': 'Authentication failed', 'details': str(e)}), 
+                                           content_type='application/json', status=401))
+
+            # Get category IDs from query parameters, default to all categories if not specified
+            category_ids = kwargs.get('category_ids')
+            if category_ids:
+                category_ids = [int(x) for x in category_ids.split(',')]
+            else:
+                category_ids = request.env['product.category'].sudo().search([]).ids
+
+            current_date = date.today()
+
+            # First, get the lot costs using a WITH clause
+            lot_costs = request.env.cr.execute("""
+                WITH lot_costs AS (
+                    SELECT
+                        sl.name as lot_name,
+                        COALESCE(svl.unit_cost, 0.0) as unit_cost
+                    FROM stock_lot sl
+                    LEFT JOIN stock_valuation_layer svl ON svl.lot_id = sl.id
+                    WHERE svl.id IN (
+                        SELECT MAX(id)
+                        FROM stock_valuation_layer
+                        WHERE lot_id IS NOT NULL
+                        GROUP BY lot_id
+                    )
+                )
+                SELECT lot_name, unit_cost FROM lot_costs
+            """)
+            lot_cost_mapping = {row['lot_name']: row['unit_cost'] for row in request.env.cr.dictfetchall()}
+
+            # Fetch valuation layers with location filtering
+            layer_ids = request.env['stock.valuation.layer'].sudo().search([
+                ('stock_move_id.location_id.usage', 'not in', ('internal', 'transit')),
+                ('stock_move_id.location_dest_id.usage', 'in', ('internal', 'transit'))
+            ])
+
+            # Filter products by categories
+            product_ids = layer_ids.mapped('product_id').filtered(lambda x: x.categ_id.id in category_ids)
+
+            # Get stock quants for on-hand quantities
+            quants = request.env['stock.quant'].sudo().search([
+                ('product_id', 'in', product_ids.ids),
+                ('location_id.usage', '=', 'internal')
+            ])
+            
+            # Create a dictionary for quick lookup of quantities and values
+            product_quantities = {}
+            for quant in quants:
+                if quant.product_id.id not in product_quantities:
+                    product_quantities[quant.product_id.id] = {
+                        'on_hand': 0.0,
+                        'reserved': 0.0,
+                        'on_hand_value': 0.0,
+                        'reserved_value': 0.0
+                    }
+                
+                # Get lot unit cost from our mapping
+                lot_unit_cost = lot_cost_mapping.get(quant.lot_id.name, 0.0) if quant.lot_id else 0.0
+                
+                on_hand_qty = quant.inventory_quantity_auto_apply
+                reserved_qty = quant.reserved_quantity
+
+                # Update quantities
+                product_quantities[quant.product_id.id]['on_hand'] += on_hand_qty
+                product_quantities[quant.product_id.id]['reserved'] += reserved_qty
+
+                # Update values
+                product_quantities[quant.product_id.id]['on_hand_value'] += on_hand_qty * lot_unit_cost
+                product_quantities[quant.product_id.id]['reserved_value'] += reserved_qty * lot_unit_cost
+
+            products_aging = []
+            
+            for product in product_ids:
+                
+                 # Fetch related product tags
+                product_tags = product.product_tag_ids.mapped('name')
+                product_tag_names = ', '.join(product_tags)
+                
+                product_quantities_info = product_quantities.get(product.id, {
+                    'on_hand': 0.0,
+                    'reserved': 0.0,
+                    'on_hand_value': 0.0,
+                    'reserved_value': 0.0
+                })
+                
+                # Calculate average unit cost
+                total_qty = product_quantities_info['on_hand'] + product_quantities_info['reserved']
+                total_value = product_quantities_info['on_hand_value'] + product_quantities_info['reserved_value']
+                unit_price = (total_value / total_qty) if total_qty > 0 else 0.0
+                
+                product_aging = {
+                    'product_code': product.default_code or '',
+                    'product_name': product.display_name,
+                    'category': product.categ_id.display_name,
+                    'product_tag': product_tag_names,
+                    'uom': product.uom_id.name,
+                    'unit_price': unit_price,
+                    'on_hand_qty': product_quantities_info['on_hand'],
+                    'on_hand_value': product_quantities_info['on_hand_value'],
+                    'reserved_qty': product_quantities_info['reserved'],
+                    'reserved_value': product_quantities_info['reserved_value'],
+                    'aging_periods': {
+                        '0-30': {'qty': 0.0, 'value': 0.0},
+                        '31-60': {'qty': 0.0, 'value': 0.0},
+                        '61-90': {'qty': 0.0, 'value': 0.0},
+                        '91-120': {'qty': 0.0, 'value': 0.0},
+                        '120+': {'qty': 0.0, 'value': 0.0}
+                    }
+                }
+                
+                # Calculate aging for each layer
+                product_layers = layer_ids.filtered(lambda x: x.product_id.id == product.id)
+                for layer in product_layers:
+                    if layer.remaining_qty <= 0:
+                        continue
+                        
+                    layer_date = layer.stock_move_id.date.date()
+                    days_diff = (current_date - layer_date).days
+                    
+                    # Assign quantities and values to appropriate aging periods
+                    if 0 <= days_diff <= 30:
+                        period = '0-30'
+                    elif 31 <= days_diff <= 60:
+                        period = '31-60'
+                    elif 61 <= days_diff <= 90:
+                        period = '61-90'
+                    elif 91 <= days_diff <= 120:
+                        period = '91-120'
+                    else:
+                        period = '120+'
+                        
+                    product_aging['aging_periods'][period]['qty'] += layer.remaining_qty
+                    product_aging['aging_periods'][period]['value'] += layer.remaining_value
+                
+                # Calculate totals
+                total_qty = sum(period['qty'] for period in product_aging['aging_periods'].values())
+                total_value = sum(period['value'] for period in product_aging['aging_periods'].values())
+                
+                product_aging['total_qty'] = total_qty
+                product_aging['total_value'] = total_value
+                
+                if total_qty > 0:  # Only include products with stock
+                    products_aging.append(product_aging)
+
+            return cors_response(Response(json.dumps({
+                'products': products_aging
+            }, default=str), content_type='application/json'))
+
+        except Exception as e:
+            _logger.error(f"Error calculating stock aging: {str(e)}")
+            return cors_response(Response(json.dumps({
+                'error': str(e)
+            }), content_type='application/json', status=500))
+            
+            
+    @http.route('/api/stock_aging_quantities', type='http', auth='none', methods=['GET'], csrf=False)
+    def get_stock_quantities(self, **kwargs):
+        try:
+            # Authenticate user
+            auth_header = request.httprequest.headers.get('Authorization')
+            if not auth_header:
+                return cors_response(Response(json.dumps({'error': 'Missing Authorization header'}), content_type='application/json', status=401))
+            try:
+                user = authenticate_user(auth_header)
+            except Exception as e:
+                return cors_response(Response(json.dumps({'error': 'Authentication failed', 'details': str(e)}), content_type='application/json', status=401))
+
+            # Get lot costs using a WITH clause
+            lot_costs_query = """
+                WITH lot_costs AS (
+                    SELECT
+                        sl.name as lot_name,
+                        COALESCE(svl.unit_cost, 0.0) as unit_cost
+                    FROM stock_lot sl
+                    LEFT JOIN stock_valuation_layer svl ON svl.lot_id = sl.id
+                    WHERE svl.id IN (
+                        SELECT MAX(id)
+                        FROM stock_valuation_layer
+                        WHERE lot_id IS NOT NULL
+                        GROUP BY lot_id
+                    )
+                )
+                SELECT lot_name, unit_cost FROM lot_costs
+            """
+            request.env.cr.execute(lot_costs_query)
+            lot_cost_mapping = {row['lot_name']: row['unit_cost'] for row in request.env.cr.dictfetchall()}
+
+            # Fetch all stock.quant records
+            stock_quants = request.env['stock.quant'].sudo().search([('location_id.usage', '=', 'internal')])
+
+            # Aggregate data by product
+            aggregated_data = {}
+            for quant in stock_quants:
+                product = quant.product_id
+                category = product.categ_id
+                lot = quant.lot_id
+                
+                # Fetch related product tags
+                product_tags = product.product_tag_ids.mapped('name')
+                product_tag_names = ', '.join(product_tags)  # Join all tag names into a single string
+
+                # Get lot unit cost
+                lot_unit_cost = lot_cost_mapping.get(lot.name, 0.0) if lot else 0.0
+
+                # Aggregate data
+                product_key = product.id
+                if product_key not in aggregated_data:
+                    aggregated_data[product_key] = {
+                        'Product Code': product.default_code,
+                        'Description': product.name,
+                        'Category': category.name,
+                        'product_tag': product_tag_names,
+                        'Sum of On Hand QTY': 0,
+                        'Sum of Reserved QTY': 0,
+                        'Unit Price': lot_unit_cost,
+                        'Sum of Value for On Hand': 0,
+                        'Sum of Value for Reserved': 0,
+                    }
+
+                aggregated_data[product_key]['Sum of On Hand QTY'] += quant.inventory_quantity_auto_apply
+                aggregated_data[product_key]['Sum of Reserved QTY'] += quant.reserved_quantity
+                aggregated_data[product_key]['Sum of Value for On Hand'] += quant.inventory_quantity_auto_apply * lot_unit_cost
+                aggregated_data[product_key]['Sum of Value for Reserved'] += quant.reserved_quantity * lot_unit_cost
+
+            # Convert aggregated data to a list
+            stock_data = list(aggregated_data.values())
+
+            return cors_response(Response(json.dumps(stock_data, default=date_handler), content_type='application/json'))
+
+        except Exception as e:
+            _logger.error(f"Error fetching stock quantities data: {str(e)}")
+            return cors_response(Response(json.dumps({'error': str(e)}), content_type='application/json', status=500))
+        
+        
+    @http.route('/api/stock_allocation', type='http', auth='none', methods=['GET'], csrf=False)
+    def get_stock_allocation(self, **kwargs):
+        try:
+            # Authentication check
+            auth_header = request.httprequest.headers.get('Authorization')
+            if not auth_header:
+                return cors_response(Response(json.dumps({'error': 'Missing Authorization header'}), content_type='application/json', status=401))
+            try:
+                user = authenticate_user(auth_header)
+            except Exception as e:
+                return cors_response(Response(json.dumps({'error': 'Authentication failed', 'details': str(e)}), content_type='application/json', status=401))
+
+            # Get lot costs using a WITH clause
+            lot_costs_query = """
+                WITH lot_costs AS (
+                    SELECT
+                        sl.name as lot_name,
+                        COALESCE(svl.unit_cost, 0.0) as unit_cost
+                    FROM stock_lot sl
+                    LEFT JOIN stock_valuation_layer svl ON svl.lot_id = sl.id
+                    WHERE svl.id IN (
+                        SELECT MAX(id)
+                        FROM stock_valuation_layer
+                        WHERE lot_id IS NOT NULL
+                        GROUP BY lot_id
+                    )
+                )
+                SELECT lot_name, unit_cost FROM lot_costs
+            """
+            request.env.cr.execute(lot_costs_query)
+            lot_cost_mapping = {row['lot_name']: row['unit_cost'] for row in request.env.cr.dictfetchall()}
+
+            # Initialize aggregated_data
+            aggregated_data = {}
+
+            # Fetch stock quants
+            stock_quants = request.env['stock.quant'].sudo().search([('location_id.usage', '=', 'internal')])
+
+            # Process quants to initialize data structure
+            for quant in stock_quants:
+                product = quant.product_id
+                product_code = product.default_code
+                
+                if not product_code:
+                    continue
+
+                product_tags = product.product_tag_ids.mapped('name')
+                product_tag_names = ', '.join(product_tags)
+
+                lot = quant.lot_id
+                lot_unit_cost = lot_cost_mapping.get(lot.name, 0.0) if lot else 0.0
+
+                if product_code not in aggregated_data:
+                    aggregated_data[product_code] = {
+                        'Product Code': product_code,
+                        'Description': product.name,
+                        'Category': product.categ_id.name,
+                        'product_tag': product_tag_names,
+                        'Sum of On Hand QTY': 0,
+                        'Sum of Reserved QTY': 0,
+                        'Allocated QTY': 0,
+                        'Unit Price': lot_unit_cost,
+                        'Sum of Value for On Hand': 0,
+                        'Sum of Value for Reserved': 0,
+                        'Allocation Orders': [],
+                        'Failed_Allocations': []
+                    }
+
+                aggregated_data[product_code]['Sum of On Hand QTY'] += quant.inventory_quantity_auto_apply
+                aggregated_data[product_code]['Sum of Value for On Hand'] += quant.inventory_quantity_auto_apply * lot_unit_cost
+
+            # Fetch and sort sale orders
+            sale_orders = request.env['sale.order.line'].sudo().search([
+                ('order_id.state', '!=', "cancel"),
+                ("order_id.delivery_status", "!=", "full")
+            ])
+            
+            sorted_orders = sorted(sale_orders, key=lambda x: x.order_id.date_order)
+
+            # Process orders for allocation
+            for order_line in sorted_orders:
+                product = order_line.product_id
+                remaining_qty = order_line.product_uom_qty - (order_line.qty_delivered or 0.0)
+                
+                if remaining_qty <= 0:
+                    continue
+
+                bom = request.env['mrp.bom'].sudo().search([
+                    ('product_tmpl_id', '=', order_line.product_id.product_tmpl_id.id)
+                ], limit=1)
+                
+                if not bom:
+                    continue
+
+                # Process each component
+                for component in bom.bom_line_ids:
+                    component_code = component.product_id.default_code
+                    if not component_code or component_code not in aggregated_data:
+                        continue
+
+                    required_qty = component.product_qty * remaining_qty
+                    available_qty = (aggregated_data[component_code]['Sum of On Hand QTY'] - 
+                                aggregated_data[component_code]['Allocated QTY'])
+
+                    if available_qty > 0:
+                        # Allocate whatever is available, up to the required amount
+                        allocate_qty = min(required_qty, available_qty)
+                        
+                        # Record the allocation
+                        aggregated_data[component_code]['Allocated QTY'] += allocate_qty
+                        aggregated_data[component_code]['Allocation Orders'].append({
+                            'order_no': order_line.order_id.name,
+                            'Product Description': product.name,
+                            'Product Code': product.default_code,
+                            'qty': allocate_qty,
+                            'customer': order_line.order_id.partner_id.name,
+                            'date': order_line.order_id.date_order
+                        })
+
+                        # If we couldn't allocate the full amount, record the shortage
+                        if allocate_qty < required_qty:
+                            shortage = required_qty - allocate_qty
+                            aggregated_data[component_code]['Failed_Allocations'].append({
+                                'order_no': order_line.order_id.name,
+                                'Product Description': product.name,
+                                'Product Code': product.default_code,
+                                'required_qty': required_qty,
+                                'allocated_qty': allocate_qty,
+                                'shortage_qty': shortage,
+                                'customer': order_line.order_id.partner_id.name,
+                                'date': order_line.order_id.date_order,
+                                'reason': f"Partial allocation: {allocate_qty} allocated, {shortage} short"
+                            })
+                    else:
+                        # Record complete failure to allocate
+                        aggregated_data[component_code]['Failed_Allocations'].append({
+                            'order_no': order_line.order_id.name,
+                            'Product Description': product.name,
+                            'Product Code': product.default_code,
+                            'required_qty': required_qty,
+                            'available_qty': 0,
+                            'customer': order_line.order_id.partner_id.name,
+                            'date': order_line.order_id.date_order,
+                            'reason': f"No stock available for allocation"
+                        })
+
+            # Calculate final available quantity
+            for data in aggregated_data.values():
+                data['Available QTY'] = (data['Sum of On Hand QTY'] - 
+                                    data['Allocated QTY'])
+
+            # Convert to list and return
+            stock_data = list(aggregated_data.values())
+            return cors_response(Response(json.dumps(stock_data, default=date_handler), content_type='application/json'))
+
+        except Exception as e:
+            _logger.error(f"Error fetching stock allocation data: {str(e)}")
+            return cors_response(Response(json.dumps({'error': str(e)}), content_type='application/json', status=500))
