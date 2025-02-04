@@ -1,0 +1,207 @@
+from odoo import http
+from odoo.http import request, Response
+import json
+from datetime import date, datetime
+import logging
+from .authentication import authenticate_user, cors_response
+
+
+_logger = logging.getLogger(__name__)
+
+def date_handler(obj):
+    if isinstance(obj, (date, datetime)):
+        return obj.isoformat()
+    if hasattr(obj, '__str__'):
+        return str(obj)
+    raise TypeError("Type not serializable")
+
+class CustomerWiseTeaAllocation(http.Controller):
+    
+    def _get_lot_standard_price(self, stock_lot):
+        """Helper method to safely get standard price from stock lot"""
+        _logger.info(f"Getting standard price for stock_lot: {stock_lot}")
+        if not stock_lot:
+            _logger.info("No stock lot provided")
+            return 0.0
+            
+        try:
+            # Get all SVL records for this lot to see the history
+            svl_records = request.env['stock.valuation.layer'].sudo().search([
+                ('lot_id', '=', stock_lot.id)
+            ], order='create_date DESC')
+            
+            _logger.info(f"Found {len(svl_records)} SVL records for lot")
+            for svl in svl_records:
+                _logger.info(f"SVL record: ID={svl.id}, Date={svl.create_date}, Cost={svl.unit_cost}")
+                
+            latest_svl = svl_records[0] if svl_records else None
+            
+            if latest_svl:
+                _logger.info(f"Using latest SVL cost: {latest_svl.unit_cost}")
+                return float(latest_svl.unit_cost or 0.0)
+                
+            _logger.info("No SVL records found, checking stock lot directly")
+            stock_lot_sudo = request.env['stock.lot'].sudo().browse(stock_lot.id)
+            _logger.info(f"Stock lot details: ID={stock_lot_sudo.id}, Name={stock_lot_sudo.name}, Standard Price={stock_lot_sudo.standard_price}")
+            
+            if isinstance(stock_lot_sudo.standard_price, dict):
+                price = float(stock_lot_sudo.standard_price.get('monetary', '0.0'))
+            else:
+                price = float(stock_lot_sudo.standard_price or 0.0)
+                
+            _logger.info(f"Final calculated price: {price}")
+            return price
+            
+        except (ValueError, AttributeError) as e:
+            _logger.error(f"Error getting standard price: {str(e)}, traceback: {traceback.format_exc()}")
+            return 0.0
+        
+    @http.route('/api/customerwiseallocation', type='http', auth='none', methods=['GET'], csrf=False)
+    def get_tea_straight_line(self, **kwargs):
+        try:
+            # Authenticate user
+            auth_header = request.httprequest.headers.get('Authorization')
+            if not auth_header:
+                return cors_response(Response(json.dumps({'error': 'Missing Authorization header'}), content_type='application/json', status=401))
+            try:
+                user = authenticate_user(auth_header)
+            except Exception as e:
+                return cors_response(Response(json.dumps({'error': 'Authentication failed', 'details': str(e)}), content_type='application/json', status=401))
+
+            # Fetch all tea auction lot records
+            demand_line = request.env['tt.tea.blend.component'].sudo().search([("blend_id.state", "in", ['draft', 'in_progress', 'confirmed'])])
+            auction_data = request.env['tea.auction.lot'].sudo()
+            # Debug logging
+            _logger.info(f"Total demand line records found: {len(demand_line)}")
+            
+            demand_data = []
+            
+            for line in demand_line:
+                lot = line.lot_id
+                try:
+                    record_data = {
+                        'Component Type': line.component_type or '',
+                        'Blend Name': line.blend_id.name if line.blend_id else '',
+                        'Tea Lot': line.lot_id.name if line.lot_id else '',
+                        'Customer Name' : line.blend_id.partner_id.name,
+                        'Net Weight': line.lot_net_weight or 0.0,
+                        'Bags': line.bags_allocated or 0,
+                        'Herb ID': line.herb_id.name if line.herb_id else '',
+                        'Killos Needed': line.kilos_needed or 0.0,
+                        'Allocation Date': line.allocation_date.strftime('%Y-%m-%d') if line.allocation_date else '',
+                        'Source Blend': line.source_blend_id.name if line.source_blend_id else '',
+                        'Blend State' : line.blend_id.state,
+                        'Blend Closing Date' : line.blend_id.blend_closing_date.strftime('%Y-%m-%d') if line.blend_id.blend_closing_date else '',
+                        
+                        
+                    }
+                    if lot or line.herb_id:
+                        # Initialize auctions as an empty recordset
+                        auctions = auction_data.browse()
+
+                        # Try searching with lot name if lot exists
+                        if lot:
+                            auctions = auction_data.search([('box_number', '=', lot.name)])
+                        
+                        # If no auctions found and herb_id exists, try searching with herb ID name
+                        if not auctions and line.herb_id:
+                            auctions = auction_data.search([('box_number', '=', line.herb_id.name)])
+                        
+                        if auctions:
+                            # Get first auction record for other fields
+                            first_auction = auctions[0]
+                            record_data.update({
+                                'Purchased_Price': first_auction.purchased_price,
+                                'Sale Date': first_auction.sale_date.strftime('%Y-%m-%d') if first_auction.sale_date else '',
+                            })
+                        else:
+                            record_data.update({
+                                # Set other auction-related fields to None or appropriate default values
+                                'Sale Date': '',
+                            })
+                    demand_data.append(record_data)
+                
+                except Exception as record_error:
+                    _logger.error(f"Error processing record: {record_error}")
+                    continue
+
+            # Return the auction data as JSON response
+            return cors_response(Response(json.dumps(demand_data, default=date_handler), content_type='application/json'))
+
+        except Exception as e:
+            _logger.error(f"Error fetching tea auction lot data: {str(e)}")
+            return cors_response(Response(json.dumps({'error': str(e)}), content_type='application/json', status=500))
+        
+        
+        
+        
+        
+        
+    @http.route('/api/blend_gain_and_balance_allocation', type='http', auth='none', methods=['GET'], csrf=False)
+    def get_tea_blend_line(self, **kwargs):
+        try:
+            # Authenticate user
+            auth_header = request.httprequest.headers.get('Authorization')
+            if not auth_header:
+                return cors_response(Response(json.dumps({'error': 'Missing Authorization header'}), content_type='application/json', status=401))
+            try:
+                user = authenticate_user(auth_header)
+            except Exception as e:
+                return cors_response(Response(json.dumps({'error': 'Authentication failed', 'details': str(e)}), content_type='application/json', status=401))
+
+            # Fetch all tea auction lot records
+            demand_line = request.env['tt.tea.blend.component'].sudo().search([("blend_id.state", "not in", ["done", "cancelled"])])
+            herb_data = request.env['tt.tea.herb'].sudo()
+            # Debug logging
+            _logger.info(f"Total demand line records found: {len(demand_line)}")
+            
+            demand_data = []
+            
+            for line in demand_line:
+                lot = line.lot_id
+                try:
+                    record_data = {
+                        'Component Type': line.component_type or '',
+                        'Blend Name': line.blend_id.name if line.blend_id else '',
+                        'Tea Lot': line.lot_id.name if line.lot_id else '',
+                        'Customer Name' : line.blend_id.partner_id.name,
+                        'Net Weight': line.lot_net_weight or 0.0,
+                        'Bags': line.bags_allocated or 0,
+                        'Herb ID': line.herb_id.name if line.herb_id else '',
+                        'Killos Needed': line.kilos_needed or 0.0,
+                        'Allocation Date': line.allocation_date.strftime('%Y-%m-%d') if line.allocation_date else '',
+                        'Source Blend': line.source_blend_id.name if line.source_blend_id else '',
+                        'Blend State' : line.blend_id.state,
+                        'Blend Closing Date' : line.blend_id.blend_closing_date.strftime('%Y-%m-%d') if line.blend_id.blend_closing_date else '',
+                        
+                    }
+                    if line.herb_id:
+                        # Initialize herbs as an empty recordset
+                        herbs = herb_data.browse()
+                        
+                        if line.herb_id:
+                            herbs = herb_data.search([('name', '=', line.herb_id.name)])
+                        
+                        if herbs:
+                            record_data.update({
+                                'BB/BG_Create_Date': herbs.sl_aging_date.strftime('%Y-%m-%d') if herbs.sl_aging_date else herbs.create_date.strftime('%Y-%m-%d'),
+                                'BB_Cost': self._get_lot_standard_price(line.herb_id.sudo().stock_lot_id)                            })
+                        else:
+                            record_data.update({
+                                # Set other herbs fields to None or appropriate default values
+                                'BB/BG_Create_Date': '',
+                                'BB_Cost' : '',
+                            })
+                    demand_data.append(record_data)
+                
+                except Exception as record_error:
+                    _logger.error(f"Error processing record: {record_error}")
+                    continue
+
+            # Return the auction data as JSON response
+            return cors_response(Response(json.dumps(demand_data, default=date_handler), content_type='application/json'))
+
+        except Exception as e:
+            _logger.error(f"Error fetching tea auction lot data: {str(e)}")
+            return cors_response(Response(json.dumps({'error': str(e)}), content_type='application/json', status=500))
+        
