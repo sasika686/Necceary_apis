@@ -1,0 +1,147 @@
+from odoo import http
+from odoo.http import request, Response
+import json
+from datetime import date, datetime
+import logging
+from .authentication import authenticate_user, cors_response
+import re
+from html import unescape
+
+_logger = logging.getLogger(__name__)
+
+def date_handler(obj):
+    if isinstance(obj, (date, datetime)):
+        return obj.isoformat()
+    raise TypeError("Type not serializable")
+
+def html_to_text(html_content):
+    if not html_content:
+        return ''
+    # Remove HTML tags
+    text = re.sub('<[^<]+?>', '', html_content)
+    # Convert HTML entities
+    text = unescape(text)
+    # Remove extra whitespace
+    text = ' '.join(text.split())
+    return text
+
+class ManufacturingOrders(http.Controller):
+    def get_blends_for_sale_line(self, sale_line_id):
+        """
+        Get all blend IDs, their corresponding product IDs, and product descriptions allocated to a specific sale order line.
+        
+        Args:
+            sale_line_id (int): ID of the sale.order.line record
+            
+        Returns:
+            list: List of dictionaries containing blend_id, product_id, and product_description
+        """
+        allocations = request.env['tt.tea.blend.demand.allocation'].sudo().search([
+            ('demand_line_id.demand_id.sale_line_id', '=', sale_line_id),
+            ('demand_line_id.demand_id.state', '!=', 'cancelled')
+        ])
+        
+        # Create list of tuples with blend, product code, and product description
+        blend_product_info = [
+            (
+                allocation.blend_id.name,
+                allocation.blend_id.product_id.default_code,
+                allocation.blend_id.product_id.name or ''  # Add product description, default to empty string if None
+            ) 
+            for allocation in allocations
+        ]
+        
+        # Remove duplicates by converting to set of tuples and back to list
+        unique_blend_product_info = list(set(blend_product_info))
+        
+        # Convert to list of dictionaries
+        result = [
+            {
+                'blend_id': blend_name,
+                'product_id': product_code,
+                'product_description': description
+            }
+            for blend_name, product_code, description in unique_blend_product_info
+        ]
+        
+        if not result:
+            _logger.info('No blend allocations found for sale line ID: %s', sale_line_id)
+        
+        return result
+    
+    @http.route('/api/manufacturing_orders', type='http', auth='none', methods=['GET'], csrf=False)
+    def get_manufacturing_orders(self, **kwargs):
+        try:
+            auth_header = request.httprequest.headers.get('Authorization')
+            if not auth_header:
+                return cors_response(Response(json.dumps({'error': 'Missing Authorization header'}), 
+                                        content_type='application/json', status=401))
+            try:
+                user = authenticate_user(auth_header)
+            except Exception as e:
+                return cors_response(Response(json.dumps({'error': 'Authentication failed', 'details': str(e)}), 
+                                        content_type='application/json', status=401))
+            
+            mo_records = request.env['mrp.production'].sudo().search([])
+            mo_data = []
+            
+            for mo in mo_records:
+                product = mo.product_id
+                sale = mo.shipment_sale_line_id
+                lot_number = mo.lot_producing_id.name if mo.lot_producing_id else None
+                
+                blend_info = self.get_blends_for_sale_line(sale.id)
+                internal_notes = html_to_text(product.description)
+                
+                move_lines = []
+                for move in mo.all_move_raw_ids:
+                    if move.product_id.default_code and 'BSTD' in move.product_id.default_code:
+                        move_data = {
+                            'move_id': move.id,
+                            'Item_name': move.product_id.name,
+                            'Item_code': move.product_id.default_code or '',
+                            'Qty': move.product_uom_qty,
+                        }
+                        move_lines.append(move_data)
+                    
+                sale_line_data = {
+                    'manufacturing_order_reference': mo.name,
+                    'product_name': product.name,
+                    'product_code': product.default_code or '',
+                    'category': product.categ_id.name or '',
+                    'internal_notes': internal_notes,
+                    'quantity_to_produce': mo.product_qty,
+                    'bom_id': mo.bom_id.id,
+                    'origin': mo.origin,
+                    'unit_of_measure': mo.product_uom_id.name,
+                    'customer': mo.mrp_partner_id.name,
+                    'lot_serial_number': lot_number,
+                    'state': mo.state,
+                    'order_reference': sale.order_id.name,
+                    'Number': sale.name_reference,
+                    'Line_Reference': sale.line_reference,
+                    'Line_Ref': sale.line_ref,
+                    'package_type': sale.package_type_id.name if sale.package_type_id else None,
+                    'package_count': sale.package_count,
+                    'Product_Code': sale.product_id.default_code,
+                    'Net_Weight': sale.product_id.net_weight,
+                    'Tea_Weight': sale.product_id.net_weight * mo.product_qty,
+                    'package_units': sale.package_units,
+                    'Order_Qty': sale.product_uom_qty,
+                    'Blend_Details': blend_info,  # Now includes both blend_id and product_id
+                    'move_lines': move_lines
+                }
+                mo_data.append(sale_line_data)
+
+            return cors_response(Response(
+                json.dumps(mo_data, default=date_handler),
+                content_type='application/json'
+            ))
+
+        except ValueError as ve:
+            return cors_response(Response(json.dumps({'error': str(ve)}), 
+                content_type='application/json', status=401))
+        except Exception as e:
+            _logger.error(f"Error in get_manufacturing_orders: {str(e)}", exc_info=True)
+            return cors_response(Response(json.dumps({'error': 'Internal server error'}), 
+                content_type='application/json', status=500))
