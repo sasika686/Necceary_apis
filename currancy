@@ -1,0 +1,36 @@
+def get_currency_rate(self, currency_id, date_str):
+        """
+        Get the currency rate for a specific currency on a specific date.
+        If no rate is found for the specific date, returns the most recent rate before that date.
+        
+        Args:
+            currency_id (int): The ID of the currency
+            date_str (str): Date in format 'YYYY-MM-DD'
+        
+        Returns:
+            float: Currency rate on the specified date or the most recent rate, or None if not found
+        """
+        try:
+            # Convert string date to date object
+            rate_date = datetime.strptime(date_str, '%Y-%m-%d').date()
+            
+            # Find the rate for the specific date
+            currency_rate = request.env['res.currency.rate'].sudo().search([
+                ('currency_id', '=', currency_id),
+                ('name', '=', rate_date)
+            ], order='name desc', limit=1)
+            
+            # If no rate found for the specific date, get the most recent rate before that date
+            if not currency_rate:
+                currency_rate = request.env['res.currency.rate'].sudo().search([
+                    ('currency_id', '=', currency_id),
+                    ('name', '<=', rate_date)
+                ], order='name desc', limit=1)
+            
+            if currency_rate:
+                return currency_rate.inverse_company_rate
+            return None
+            
+        except Exception as e:
+            _logger.error(f"Error in get_currency_rate: {str(e)}", exc_info=True)
+            return None
