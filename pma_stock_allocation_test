@@ -1,0 +1,175 @@
+from odoo import http
+from odoo.http import request, Response
+import json
+from datetime import date, datetime
+import logging
+from .authentication import authenticate_user, cors_response
+
+_logger = logging.getLogger(__name__)
+
+def date_handler(obj):
+    if isinstance(obj, (date, datetime)):
+        return obj.isoformat()
+    raise TypeError("Type not serializable")
+
+class PackingMaterialAvailability(http.Controller):
+    
+    @http.route('/api/pma_stock_allocation_test', type='http', auth='none', methods=['GET'], csrf=False)
+    def get_stock_allocation(self, **kwargs):
+        try:
+            # Authentication check
+            auth_header = request.httprequest.headers.get('Authorization')
+            if not auth_header:
+                return cors_response(Response(json.dumps({'error': 'Missing Authorization header'}), 
+                                    content_type='application/json', status=401))
+            try:
+                user = authenticate_user(auth_header)
+            except Exception as e:
+                return cors_response(Response(json.dumps({'error': 'Authentication failed', 'details': str(e)}), 
+                                    content_type='application/json', status=401))
+
+            # Fetch sale order lines
+            sale_orders = request.env['sale.order.line'].sudo().search([
+                ('order_id.state', '!=', 'cancel'),
+            ])
+            
+            # Sort orders by date
+            sorted_orders = sorted(sale_orders, key=lambda x: x.order_id.date_order)
+
+            # Initialize a dictionary to track available stock for each component
+            component_stock = {}
+
+            # Fetch all internal stock quants and initialize component stock
+            stock_quants = request.env['stock.quant'].sudo().search([
+                ('location_id.usage', '=', 'internal')
+            ])
+            for quant in stock_quants:
+                component_code = quant.product_id.default_code
+                if component_code:  # Only process components with a code
+                    if component_code not in component_stock:
+                        component_stock[component_code] = 0
+                    component_stock[component_code] += quant.quantity
+
+            # Initialize data structure to hold allocation details
+            allocation_data = []
+
+            # Process each sale order line
+            for order_line in sorted_orders:
+                product = order_line.product_id
+                ordered_qty = order_line.product_uom_qty
+                delivered_qty = order_line.qty_delivered
+
+                # Get related manufacturing orders
+                manufacturing_orders = request.env['mrp.production'].sudo().search([
+                    ('shipment_sale_line_id', '=', order_line.id),
+                    ('product_id', '=', product.id),
+                    ('state', '=', 'done')
+                ])
+                
+                # Calculate total manufactured quantity
+                manufactured_qty = sum(mo.qty_producing for mo in manufacturing_orders)
+                
+                # Consider delivered quantity if no manufacturing orders exist
+                if not manufacturing_orders:
+                    # Use delivered quantity instead of manufactured quantity
+                    remaining_qty = ordered_qty - delivered_qty
+                else:
+                    # Continue with the original calculation using manufactured quantity
+                    remaining_qty = ordered_qty - manufactured_qty
+                    
+                # Skip if there's nothing remaining to allocate    
+                if remaining_qty <= 0:
+                    continue
+                    
+                shipment_line_names = ""
+                if hasattr(order_line, 'shipment_line_ids') and order_line.shipment_line_ids:
+                    names = []
+                    for line in order_line.shipment_line_ids:
+                        if line.shipment_id and line.shipment_id.name:
+                            names.append(line.shipment_id.name)
+                    shipment_line_names = ", ".join(names)
+                            
+                # Get the BOM for the product
+                bom = request.env['mrp.bom'].sudo().search([
+                    ('product_tmpl_id', '=', product.product_tmpl_id.id)
+                ], limit=1)
+                
+                if not bom:
+                    continue
+
+                # Prepare BOM details
+                bom_details = []
+                for component in bom.bom_line_ids:
+                    component_code = component.product_id.default_code
+                    if not component_code:
+                        continue
+
+                    # Calculate required quantity for the component
+                    required_qty = component.product_qty * remaining_qty
+
+                    # Get available stock for the component from the tracked stock
+                    available_qty = component_stock.get(component_code, 0)
+
+                    allocate_qty = required_qty
+                    remaining_after_allocation = available_qty - required_qty
+
+                    # Update the tracked stock (in memory, not in the database)
+                    component_stock[component_code] = remaining_after_allocation
+                    
+                    # Get supplier information for the component
+                    supplier_info = request.env['product.supplierinfo'].sudo().search([
+                        ('product_tmpl_id', '=', component.product_id.product_tmpl_id.id)
+                    ], limit=1)
+                    
+                    # Add component details to BOM details
+                    bom_details.append({
+                        "Component Code": component_code,
+                        "Component Name": component.product_id.name,
+                        "Component Qty": component.product_qty,
+                        "Allocated Qty": allocate_qty,
+                        "Remaining Qty": remaining_after_allocation,
+                        'Lead Time': supplier_info.delay if supplier_info else 0,
+                        'Order Minimum': supplier_info.min_qty if supplier_info else 0
+                    })
+                            
+                # Prepare product and order details
+                product_data = {
+                    "Product Description": product.name,
+                    "Product Code": product.default_code,
+                    "Product Category": product.categ_id.name,
+                    "Product Variant ID": product.id,
+                    "Sale Price": order_line.price_unit,
+                    "Order No": order_line.order_id.name,
+                    "Number": order_line.name_reference if hasattr(order_line, 'name_reference') else "",
+                    "Line Reference": order_line.line_reference if hasattr(order_line, 'line_reference') else "",
+                    "Order Date": order_line.order_id.date_order.isoformat() if order_line.order_id.date_order else "",
+                    'Delivery Date': order_line.order_id.commitment_date.isoformat() if order_line.order_id.commitment_date else "",
+                    "Customer Ref": order_line.order_id.client_order_ref or "",
+                    "Units": order_line.product_uom.name,
+                    "Order Qty": ordered_qty,
+                    "Delivered Qty": delivered_qty,
+                    "Ready": manufactured_qty,
+                    "Planed": order_line.qty_planned if hasattr(order_line, 'qty_planned') else 0,
+                    "Invoiced": order_line.qty_invoiced,
+                    "Unit Price": order_line.price_unit,
+                    "Total": order_line.price_total,
+                    "Price List": order_line.order_id.pricelist_id.name if order_line.order_id.pricelist_id else "",
+                    "Customer Name": order_line.order_id.partner_id.name if order_line.order_id.partner_id else "",
+                    "Sales Person": order_line.order_id.user_id.name if order_line.order_id.user_id else "",
+                    "Sales Team": order_line.order_id.team_id.name if order_line.order_id.team_id else "",
+                    "Status": order_line.order_id.state,
+                    "BOM Details": bom_details,
+                    "Shipment Line IDs": shipment_line_names
+                }
+
+                # Add product data to allocation data
+                allocation_data.append(product_data)
+
+            # Return the allocation data
+            return cors_response(Response(json.dumps(allocation_data, default=str), 
+                                content_type='application/json'))
+
+        except Exception as e:
+            _logger.error(f"Error fetching stock allocation data: {str(e)}")
+            return cors_response(Response(json.dumps({'error': str(e)}), 
+                                content_type='application/json', status=500))
